@@ -22,6 +22,8 @@ class CROMA(nn.Module):
                  decoder_layers=1,
                  total_channels=14,
                  num_patches=225,
+                 opt_channels=4,
+                 radar_channels=1,
                  ):
         super().__init__()
         self.encoder_dim = encoder_dim
@@ -29,23 +31,26 @@ class CROMA(nn.Module):
         self.decoder_dim = decoder_dim
         self.decoder_layers = decoder_layers
         self.attention_heads = attention_heads
+        self.opt_channels = opt_channels
+        self.radar_channels = radar_channels
         self.num_patches = num_patches
         self.patch_size = patch_size
         self.total_channels = total_channels
+        # use configurable channel numbers instead of hard-coded 2/12
         self.radar_encoder = ViT(num_patches=self.num_patches,
-                                          dim=self.encoder_dim,
-                                          layers=int(self.encoder_layers/2),
-                                          attention_heads=self.attention_heads,
-                                          in_channels=2,
-                                          patch_size=self.patch_size,
-                                          )
+                     dim=self.encoder_dim,
+                     layers=int(self.encoder_layers/2),
+                     attention_heads=self.attention_heads,
+                     in_channels=self.radar_channels,
+                     patch_size=self.patch_size,
+                     )
         self.optical_encoder = ViT(num_patches=self.num_patches,
-                                          dim=self.encoder_dim,
-                                          layers=self.encoder_layers,
-                                          attention_heads=self.attention_heads,
-                                          in_channels=12,
-                                          patch_size=self.patch_size,
-                                          )
+                       dim=self.encoder_dim,
+                       layers=self.encoder_layers,
+                       attention_heads=self.attention_heads,
+                       in_channels=self.opt_channels,
+                       patch_size=self.patch_size,
+                       )
         self.cross_encoder = BaseTransformerCrossAttn(dim=self.encoder_dim,
                                                       layers=int(self.encoder_layers/2),
                                                       attention_heads=self.attention_heads,
@@ -63,13 +68,15 @@ class CROMA(nn.Module):
             nn.Linear(int(4*self.encoder_dim), self.encoder_dim)
         )
         self.decoder = DecoderMAE(num_patches=self.num_patches,
-                                              encoder_dim=self.encoder_dim,
-                                              decoder_dim=self.decoder_dim,
-                                              decoder_layers=self.decoder_layers,
-                                              attention_heads=8,
-                                              total_channels=self.total_channels,
-                                              patch_size=self.patch_size,
-                                              )
+                      encoder_dim=self.encoder_dim,
+                      decoder_dim=self.decoder_dim,
+                      decoder_layers=self.decoder_layers,
+                      attention_heads=8,
+                      total_channels=self.total_channels,
+                      opt_channels=self.opt_channels,
+                      radar_channels=self.radar_channels,
+                      patch_size=self.patch_size,
+                      )
         self.attn_bias = get_alibi(attention_heads=self.attention_heads,
                                                num_patches=self.num_patches)
         self.global_contrast_loss = ContrastLossInput(projection_input=self.encoder_dim,
@@ -78,8 +85,8 @@ class CROMA(nn.Module):
 
     def forward(self, imgs, radar_mask_info, optical_mask_info, rank, world_size):
         # split stacked image into optical and radar
-        radar_imgs = imgs[:, 12:, ...]
-        optical_imgs = imgs[:, :12, ...]
+        radar_imgs = imgs[:, self.opt_channels:, ...]
+        optical_imgs = imgs[:, :self.opt_channels, ...]
 
         # create independent random masks
         radar_masked_attn_bias = apply_mask_to_alibi(alibi=self.attn_bias.to(radar_imgs.device),
@@ -281,7 +288,8 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float)
+    # np.float 在新版本 NumPy 中已废弃，这里使用内置 float 以保持兼容
+    omega = np.arange(embed_dim // 2, dtype=float)
     omega /= embed_dim / 2.
     omega = 1. / 10000 ** omega  # (D/2,)
     pos = pos.reshape(-1)  # (M,)
@@ -352,6 +360,14 @@ def apply_mask_to_alibi(alibi, ids_keep_queries, ids_keep_keys, batch_size, orig
 
 
 def gather_features(features, world_size):
+    """Gather features across processes.
+
+    当 world_size==1 或未初始化分布式时，直接返回本地 features，
+    这样可以在单卡/非分布式环境下正常预训练，不需要 init_process_group。
+    """
+    if world_size == 1 or (not dist.is_available()) or (not dist.is_initialized()):
+        return features
+
     gathered_image_features = [torch.zeros_like(features) for _ in range(world_size)]
     dist.all_gather(gathered_image_features, features)
     all_features = torch.cat(gathered_image_features, dim=0)
@@ -439,6 +455,8 @@ class DecoderMAE(nn.Module):
                  decoder_layers=12,
                  attention_heads=16,
                  total_channels=14,
+                 opt_channels=12,
+                 radar_channels=2,
                  patch_size=8,
                  ):
         super().__init__()
@@ -447,6 +465,12 @@ class DecoderMAE(nn.Module):
         self.attention_heads = attention_heads
         self.num_patches = num_patches
         self.patch_size = patch_size
+        self.total_channels = total_channels
+        self.opt_channels = opt_channels
+        self.radar_channels = radar_channels
+        # assume square grid of patches
+        self.h_patches = int(num_patches ** 0.5)
+        self.w_patches = int(num_patches ** 0.5)
         self.encoder_to_decoder = nn.Linear(encoder_dim, self.decoder_dim)
         self.decoder = BaseTransformer(dim=self.decoder_dim,
                                        layers=self.decoder_layers,
@@ -472,9 +496,29 @@ class DecoderMAE(nn.Module):
         x = self.linear_output(self.decoder(x))
 
         # split pixel predictions into optical and radar
-        pred = rearrange(x, 'b (h w) (c i j) -> b c (h i) (w j)', c=14, i=8, j=8, h=15, w=15)
-        pred_optical = rearrange(pred[:, :12, :, :], 'b c (h i) (w j) -> b (h w) (c i j)', c=12, i=8, j=8)
-        pred_radar = rearrange(pred[:, 12:, :, :], 'b c (h i) (w j) -> b (h w) (c i j)', c=2, i=8, j=8)
+        pred = rearrange(
+            x,
+            'b (h w) (c i j) -> b c (h i) (w j)',
+            c=self.total_channels,
+            i=self.patch_size,
+            j=self.patch_size,
+            h=self.h_patches,
+            w=self.w_patches,
+        )
+        pred_optical = rearrange(
+            pred[:, : self.opt_channels, :, :],
+            'b c (h i) (w j) -> b (h w) (c i j)',
+            c=self.opt_channels,
+            i=self.patch_size,
+            j=self.patch_size,
+        )
+        pred_radar = rearrange(
+            pred[:, self.opt_channels :, :, :],
+            'b c (h i) (w j) -> b (h w) (c i j)',
+            c=self.radar_channels,
+            i=self.patch_size,
+            j=self.patch_size,
+        )
 
         # apply patch-wise normalization
         mean = target.mean(dim=-1, keepdim=True)
@@ -482,9 +526,29 @@ class DecoderMAE(nn.Module):
         target = (target - mean) / (var + 1.e-6) ** .5
 
         # split target into optical and radar
-        target = rearrange(target, 'b (h w) (c i j) -> b c (h i) (w j)', c=14, i=8, j=8, h=15, w=15)
-        target_optical = rearrange(target[:, :12, :, :], 'b c (h i) (w j) -> b (h w) (c i j)', c=12, i=8, j=8)
-        target_radar = rearrange(target[:, 12:, :, :], 'b c (h i) (w j) -> b (h w) (c i j)', c=2, i=8, j=8)
+        target = rearrange(
+            target,
+            'b (h w) (c i j) -> b c (h i) (w j)',
+            c=self.total_channels,
+            i=self.patch_size,
+            j=self.patch_size,
+            h=self.h_patches,
+            w=self.w_patches,
+        )
+        target_optical = rearrange(
+            target[:, : self.opt_channels, :, :],
+            'b c (h i) (w j) -> b (h w) (c i j)',
+            c=self.opt_channels,
+            i=self.patch_size,
+            j=self.patch_size,
+        )
+        target_radar = rearrange(
+            target[:, self.opt_channels :, :, :],
+            'b c (h i) (w j) -> b (h w) (c i j)',
+            c=self.radar_channels,
+            i=self.patch_size,
+            j=self.patch_size,
+        )
 
         # calculate optical reconstruction loss
         loss_optical = (pred_optical - target_optical) ** 2

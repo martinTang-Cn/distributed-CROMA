@@ -10,7 +10,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch import distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from datasets import WHUOptSarPatchDataset
+from datasets import WHUOptSarPatchDataset, BigEarthNetDataset
 from pretrain_croma import CROMA, get_mask
 
 OPT_CHANNELS = 4  # 光谱通道数 
@@ -19,7 +19,7 @@ SAR_CHANNELS = 1    # SAR通道数
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Pretrain CROMA on WHU Opt-SAR patches (no labels)")
-    parser.add_argument("--data_root", type=str, default="../whu-opt-sar",
+    parser.add_argument("--data_root", type=str, default="/home/featurize/data",
                         help="WHU 光学-SAR 数据根目录，包含 optical/sar/lbl 子目录")
     parser.add_argument("--image_size", type=int, default=256,
                         help="WHU数据集中裁剪出来的图像尺寸，等于 WHUOptSarPatchDataset.patch_size")
@@ -33,11 +33,11 @@ def parse_args():
     parser.add_argument("--mask_ratio_optical", type=float, default=0.75,
                         help="光学分支 MAE 掩码比例")
     parser.add_argument("--encoder_dim", type=int, default=768)
-    parser.add_argument("--encoder_layers", type=int, default=12)
+    parser.add_argument("--encoder_layers", type=int, default=6)
     parser.add_argument("--attention_heads", type=int, default=16)
     parser.add_argument("--decoder_dim", type=int, default=512)
     parser.add_argument("--decoder_layers", type=int, default=1)
-    parser.add_argument("--output_dir", type=str, default="../CROMA_checkpoint/croma_whu_pretrain_checkpoints")
+    parser.add_argument("--output_dir", type=str, default="/home/featurize/data/whu-opt-sar-dataset")
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--num_ratio", type=float, default=1.0,
                         help="使用多少比例的训练集（<1 代表子集，>1 代表有放回扩增）")
@@ -45,24 +45,39 @@ def parse_args():
                         help="滑动窗口步长与 image_size 的比例")
     parser.add_argument("--max_grad_norm", type=float, default=0.0,
                         help=">0 时启用梯度裁剪")
+    parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet"], default="whu",
+                        help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset")
     return parser.parse_args()
 
 
 def create_loaders(args, rank, world_size, distributed):
-    train_set = WHUOptSarPatchDataset(
-        root_dir=args.data_root,
-        split="train",
-        patch_size=args.image_size,
-        stride_ratio=args.stride_ratio,
-        num_ratio=args.num_ratio,
-    )
-    val_set = WHUOptSarPatchDataset(
-        root_dir=args.data_root,
-        split="val",
-        patch_size=args.image_size,
-        stride_ratio=args.stride_ratio,
-        num_ratio=1.0,
-    )
+    # 支持 WHU 和 BigEarthNet 两种数据集
+    if args.dataset == "whu":
+        train_set = WHUOptSarPatchDataset(
+            root_dir=args.data_root,
+            split="train",
+            patch_size=args.image_size,
+            stride_ratio=args.stride_ratio,
+            num_ratio=args.num_ratio,
+        )
+        val_set = WHUOptSarPatchDataset(
+            root_dir=args.data_root,
+            split="val",
+            patch_size=args.image_size,
+            stride_ratio=args.stride_ratio,
+            num_ratio=1.0,
+        )
+    else:  # bigearthnet
+        train_set = BigEarthNetDataset(
+            root=args.data_root,
+            split="train",
+            ratio=args.num_ratio,
+        )
+        val_set = BigEarthNetDataset(
+            root=args.data_root,
+            split="validation",
+            ratio=1.0,
+        )
 
     if distributed:
         train_sampler = DistributedSampler(
@@ -103,12 +118,34 @@ def create_loaders(args, rank, world_size, distributed):
         drop_last=False,
     )
 
-    return train_loader, val_loader
+    # 尝试从数据集中推断实际的 patch 数，以避免与 args.image_size 不一致
+    inferred_num_patches = None
+    try:
+        sample = train_set[0]
+        # sample 返回 (optical, sar, ...) 其中 optical shape = (C, H, W)
+        optical_sample = sample[0]
+        _, H, W = optical_sample.shape
+        inferred_num_patches = (H // 8) * (W // 8)
+    except Exception:
+        inferred_num_patches = None
+
+    return train_loader, val_loader, inferred_num_patches
 
 
-def build_model(args, device):
-    assert args.image_size % 8 == 0, "image_size 必须能被 8 整除，以适配 CROMA 的 patch_size=8"
-    num_patches = (args.image_size // 8) ** 2
+def build_model(args, device, inferred_num_patches=None):
+    # Prefer inferred_num_patches (from actual dataset samples) to avoid mismatch
+    if inferred_num_patches is None:
+        assert args.image_size % 8 == 0, "image_size 必须能被 8 整除，以适配 CROMA 的 patch_size=8"
+        num_patches = (args.image_size // 8) ** 2
+    else:
+        num_patches = inferred_num_patches
+    # 根据所选数据集设置光学与雷达通道数
+    if args.dataset == "whu":
+        opt_ch = 4
+        radar_ch = 1
+    else:  # bigearthnet
+        opt_ch = 10
+        radar_ch = 2
 
     model = CROMA(
         patch_size=8,
@@ -117,10 +154,10 @@ def build_model(args, device):
         attention_heads=args.attention_heads,
         decoder_dim=args.decoder_dim,
         decoder_layers=args.decoder_layers,
-        total_channels=OPT_CHANNELS + SAR_CHANNELS,
+        total_channels=opt_ch + radar_ch,
         num_patches=num_patches,
-        opt_channels=OPT_CHANNELS,
-        radar_channels=SAR_CHANNELS
+        opt_channels=opt_ch,
+        radar_channels=radar_ch,
     )
     model.to(device)
     return model, num_patches
@@ -309,11 +346,13 @@ def main():
     if rank == 0:
         print(f"Distributed: {distributed}, world_size: {world_size}, device: {device}")
 
-    train_loader, val_loader = create_loaders(args, rank, world_size, distributed)
+    train_loader, val_loader, inferred_num_patches = create_loaders(args, rank, world_size, distributed)
     if rank == 0:
         print(f"Train patches: {len(train_loader.dataset)}, Val patches: {len(val_loader.dataset)}")
+        if inferred_num_patches is not None:
+            print(f"Inferred num_patches from data: {inferred_num_patches}")
 
-    model, num_patches = build_model(args, device)
+    model, num_patches = build_model(args, device, inferred_num_patches=inferred_num_patches)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
@@ -321,7 +360,7 @@ def main():
 
     # 为本次运行创建独立的时间戳目录及指标文件路径（仅 rank 0 实际创建）
     if rank == 0:
-        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{args.dataset}"
         run_dir = os.path.join(args.output_dir, run_timestamp)
         os.makedirs(run_dir, exist_ok=True)
         metrics_path = os.path.join(run_dir, "epoch_metrics.csv")

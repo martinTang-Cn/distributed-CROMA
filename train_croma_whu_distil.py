@@ -1,19 +1,19 @@
 """
-Split Learning 分割训练脚本
+Distillation 分割训练脚本（卫星-地面协同）
 
 场景描述:
-- 光学卫星: 部署 optical_encoder，处理光学图像
-- 雷达卫星: 部署 radar_encoder，处理雷达图像
-- 地面服务器: 部署 cross_encoder + seg_head，完成融合和分割
+- 光学卫星: 部署 optical_encoder + 本地 seg_head
+- 雷达卫星: 部署 radar_encoder + 本地 seg_head
+- 地面服务器: 部署 cross_encoder + seg_head，完成融合和监督训练
 
 训练流程:
 1. 卫星端前向传播，生成中间激活值
 2. 激活值传输到地面服务器（模拟通信）
-3. 服务器完成前向传播和损失计算
-4. 服务器反向传播，计算激活值梯度
-5. 梯度传回卫星，卫星完成编码器反向传播
+3. 服务器完成前向传播、监督损失计算并更新
+4. 服务器将预测 logits 回传给两个卫星客户端
+5. 两端客户端用本地预测与服务器预测做 KL 蒸馏更新
 
-注意: Split Learning 仅用于分割训练，预训练阶段不使用。
+注意: 该脚本用于分割训练，预训练阶段不使用。
 """
 
 import os
@@ -38,11 +38,11 @@ SAR_CHANNELS = 1
 
 @dataclass
 class SplitLearningStats:
-    """记录 Split Learning 通信统计"""
+    """记录训练通信统计"""
     # 前向传播: 激活值传输 (卫星 -> 服务器)
     forward_optical_bytes: int = 0
     forward_radar_bytes: int = 0
-    # 反向传播: 梯度传输 (服务器 -> 卫星)
+    # 服务器回传: 教师预测传输 (服务器 -> 卫星)
     backward_optical_bytes: int = 0
     backward_radar_bytes: int = 0
 
@@ -51,10 +51,10 @@ class SplitLearningStats:
         self.forward_optical_bytes += optical_act.numel() * optical_act.element_size()
         self.forward_radar_bytes += radar_act.numel() * radar_act.element_size()
 
-    def add_backward(self, optical_grad: torch.Tensor, radar_grad: torch.Tensor):
-        """记录反向传播的梯度大小"""
-        self.backward_optical_bytes += optical_grad.numel() * optical_grad.element_size()
-        self.backward_radar_bytes += radar_grad.numel() * radar_grad.element_size()
+    def add_backward(self, optical_teacher_pred: torch.Tensor, radar_teacher_pred: torch.Tensor):
+        """记录服务器回传教师预测的通信量"""
+        self.backward_optical_bytes += optical_teacher_pred.numel() * optical_teacher_pred.element_size()
+        self.backward_radar_bytes += radar_teacher_pred.numel() * radar_teacher_pred.element_size()
 
     def total_bytes(self) -> int:
         return (self.forward_optical_bytes + self.forward_radar_bytes +
@@ -77,10 +77,24 @@ class OpticalSatelliteClient(nn.Module):
     - 接收梯度并更新本地模型
     """
 
-    def __init__(self, optical_encoder: nn.Module, attn_bias: torch.Tensor):
+    def __init__(
+        self,
+        optical_encoder: nn.Module,
+        attn_bias: torch.Tensor,
+        encoder_dim: int,
+        num_patches: int,
+        num_classes: int,
+    ):
         super().__init__()
         self.encoder = optical_encoder
         self.register_buffer('attn_bias', attn_bias)
+        self.h_patches = int(num_patches ** 0.5)
+        self.w_patches = int(num_patches ** 0.5)
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(encoder_dim, encoder_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(encoder_dim, num_classes, kernel_size=1),
+        )
 
     def forward(self, optical_imgs: torch.Tensor) -> torch.Tensor:
         """
@@ -98,25 +112,46 @@ class OpticalSatelliteClient(nn.Module):
         )
         return optical_encodings
 
-    def local_step(self, optical_imgs: torch.Tensor, grad_from_server: torch.Tensor,
-                   optimizer: torch.optim.Optimizer, max_grad_norm: float = 0.0):
+    def predict(self, optical_encodings: torch.Tensor, output_size: Tuple[int, int]) -> torch.Tensor:
+        b, n, d = optical_encodings.shape
+        assert n == self.h_patches * self.w_patches
+        feat = (
+            optical_encodings.view(b, self.h_patches, self.w_patches, d)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        logits_low = self.seg_head(feat)
+        return F.interpolate(logits_low, size=output_size, mode="bilinear", align_corners=False)
+
+    def local_step(
+        self,
+        optical_imgs: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        temperature: float = 1.0,
+        max_grad_norm: float = 0.0,
+    ) -> float:
         """
         完成本地反向传播和参数更新
         
         Args:
             optical_imgs: 原始光学图像
-            grad_from_server: 服务器返回的激活值梯度
+            teacher_logits: 服务器返回的教师预测
             optimizer: 本地优化器
+            temperature: 蒸馏温度
             max_grad_norm: 梯度裁剪阈值
         """
         optimizer.zero_grad(set_to_none=True)
-        # 重新前向传播以建立计算图
         optical_encodings = self.forward(optical_imgs)
-        # 使用服务器传来的梯度进行反向传播
-        optical_encodings.backward(grad_from_server)
+        student_logits = self.predict(optical_encodings, output_size=optical_imgs.shape[-2:])
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+        student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+        kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
+        kd_loss.backward()
         if max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
         optimizer.step()
+        return kd_loss.item()
 
 
 class RadarSatelliteClient(nn.Module):
@@ -129,10 +164,24 @@ class RadarSatelliteClient(nn.Module):
     - 接收梯度并更新本地模型
     """
 
-    def __init__(self, radar_encoder: nn.Module, attn_bias: torch.Tensor):
+    def __init__(
+        self,
+        radar_encoder: nn.Module,
+        attn_bias: torch.Tensor,
+        encoder_dim: int,
+        num_patches: int,
+        num_classes: int,
+    ):
         super().__init__()
         self.encoder = radar_encoder
         self.register_buffer('attn_bias', attn_bias)
+        self.h_patches = int(num_patches ** 0.5)
+        self.w_patches = int(num_patches ** 0.5)
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(encoder_dim, encoder_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(encoder_dim, num_classes, kernel_size=1),
+        )
 
     def forward(self, radar_imgs: torch.Tensor) -> torch.Tensor:
         """
@@ -150,23 +199,46 @@ class RadarSatelliteClient(nn.Module):
         )
         return radar_encodings
 
-    def local_step(self, radar_imgs: torch.Tensor, grad_from_server: torch.Tensor,
-                   optimizer: torch.optim.Optimizer, max_grad_norm: float = 0.0):
+    def predict(self, radar_encodings: torch.Tensor, output_size: Tuple[int, int]) -> torch.Tensor:
+        b, n, d = radar_encodings.shape
+        assert n == self.h_patches * self.w_patches
+        feat = (
+            radar_encodings.view(b, self.h_patches, self.w_patches, d)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        logits_low = self.seg_head(feat)
+        return F.interpolate(logits_low, size=output_size, mode="bilinear", align_corners=False)
+
+    def local_step(
+        self,
+        radar_imgs: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        temperature: float = 1.0,
+        max_grad_norm: float = 0.0,
+    ) -> float:
         """
         完成本地反向传播和参数更新
         
         Args:
             radar_imgs: 原始雷达图像
-            grad_from_server: 服务器返回的激活值梯度
+            teacher_logits: 服务器返回的教师预测
             optimizer: 本地优化器
+            temperature: 蒸馏温度
             max_grad_norm: 梯度裁剪阈值
         """
         optimizer.zero_grad(set_to_none=True)
         radar_encodings = self.forward(radar_imgs)
-        radar_encodings.backward(grad_from_server)
+        student_logits = self.predict(radar_encodings, output_size=radar_imgs.shape[-2:])
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+        student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+        kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
+        kd_loss.backward()
         if max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
         optimizer.step()
+        return kd_loss.item()
 
 
 class GroundServer(nn.Module):
@@ -262,8 +334,9 @@ class SplitLearningTrainer:
         radar_optimizer: torch.optim.Optimizer,
         server_optimizer: torch.optim.Optimizer,
         criterion: nn.Module,
+        distill_temperature: float = 1.0,
         max_grad_norm: float = 0.0,
-    ) -> float:
+    ) -> Tuple[float, float, float, float]:
         """
         执行一次 Split Learning 训练步骤
         
@@ -271,12 +344,15 @@ class SplitLearningTrainer:
         1. 卫星端前向传播
         2. 激活值传输到服务器（模拟）
         3. 服务器前向传播 + 损失计算
-        4. 服务器反向传播，获取激活值梯度
-        5. 梯度传回卫星（模拟）
-        6. 卫星端反向传播 + 参数更新
+        4. 服务器反向传播并更新参数
+        5. 服务器预测传回卫星（模拟）
+        6. 卫星端使用 KL 蒸馏更新本地参数
         
         Returns:
-            loss: 当前步骤的损失值
+            total_loss: 总损失（server_ce + optical_kd + radar_kd）
+            server_ce_loss: 服务器监督损失
+            optical_kd_loss: 光学客户端蒸馏损失
+            radar_kd_loss: 雷达客户端蒸馏损失
         """
         optical_imgs = optical_imgs.to(self.device, non_blocking=True)
         radar_imgs = radar_imgs.to(self.device, non_blocking=True)
@@ -294,9 +370,9 @@ class SplitLearningTrainer:
 
         # ========== 阶段 2: 激活值传输到服务器（模拟通信） ==========
         # 在实际场景中，这里会有网络传输
-        # 我们使用 .detach() 模拟传输切断，同时保留 requires_grad 以便计算梯度
-        optical_act = optical_encodings.detach().requires_grad_(True)
-        radar_act = radar_encodings.detach().requires_grad_(True)
+        # 我们使用 .detach() 模拟跨设备传输切断
+        optical_act = optical_encodings.detach()
+        radar_act = radar_encodings.detach()
         
         # 记录通信量
         self.stats.add_forward(optical_act, radar_act)
@@ -312,30 +388,40 @@ class SplitLearningTrainer:
             attn_bias=attn_bias,
             output_size=(H, W)
         )
-        loss = criterion(logits, labels)
+        server_ce_loss = criterion(logits, labels)
 
-        # ========== 阶段 4: 服务器反向传播 ==========
-        loss.backward()
+        # ========== 阶段 4: 服务器反向传播并更新参数 ==========
+        server_ce_loss.backward()
         
         if max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(self.ground_server.parameters(), max_grad_norm)
         server_optimizer.step()
 
-        # 获取激活值的梯度（将传回卫星）
-        optical_grad = optical_act.grad.detach()
-        radar_grad = radar_act.grad.detach()
+        teacher_logits = logits.detach()
 
-        # ========== 阶段 5: 梯度传回卫星（模拟通信） ==========
-        self.stats.add_backward(optical_grad, radar_grad)
+        # ========== 阶段 5: 服务器预测传回卫星（模拟通信） ==========
+        self.stats.add_backward(teacher_logits, teacher_logits)
 
-        # ========== 阶段 6: 卫星端反向传播 + 参数更新 ==========
-        # 光学卫星本地更新
-        self.optical_client.local_step(optical_imgs, optical_grad, optical_optimizer, max_grad_norm)
-        
-        # 雷达卫星本地更新
-        self.radar_client.local_step(radar_imgs, radar_grad, radar_optimizer, max_grad_norm)
+        # ========== 阶段 6: 卫星端 KL 蒸馏更新 ==========
+        optical_kd_loss = self.optical_client.local_step(
+            optical_imgs=optical_imgs,
+            teacher_logits=teacher_logits,
+            optimizer=optical_optimizer,
+            temperature=distill_temperature,
+            max_grad_norm=max_grad_norm,
+        )
 
-        return loss.item()
+        radar_kd_loss = self.radar_client.local_step(
+            radar_imgs=radar_imgs,
+            teacher_logits=teacher_logits,
+            optimizer=radar_optimizer,
+            temperature=distill_temperature,
+            max_grad_norm=max_grad_norm,
+        )
+
+        server_ce_loss_value = server_ce_loss.item()
+        total_loss = server_ce_loss_value + optical_kd_loss + radar_kd_loss
+        return total_loss, server_ce_loss_value, optical_kd_loss, radar_kd_loss
 
     @torch.no_grad()
     def evaluate_step(
@@ -379,16 +465,16 @@ class SplitLearningTrainer:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Split Learning 分割训练 - 卫星与地面服务器协同"
+        description="Distillation 分割训练 - 卫星与地面服务器协同"
     )
     parser.add_argument(
         "--data_root",
         type=str,
-        default="../whu-opt-sar",
+        default="/home/featurize/data",
         help="WHU 光学-SAR 数据根目录",
     )
     parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
     
@@ -413,12 +499,13 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="../CROMA_checkpoint/croma_whu_split_learning_checkpoints",
+        default="/home/featurize/work/CROMA_checkpoint/croma_whu_distil_checkpoints",
     )
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--num_ratio", type=float, default=1.0)
     parser.add_argument("--stride_ratio", type=float, default=0.9)
     parser.add_argument("--max_grad_norm", type=float, default=0.0)
+    parser.add_argument("--distill_temperature", type=float, default=1.0)
     parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet"], default="whu",
                         help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset")
     return parser.parse_args()
@@ -484,8 +571,7 @@ def create_loaders(args):
     return train_loader, val_loader, inferred_num_patches
 
 
-
-def build_split_learning_components(args, device, inferred_num_patches):
+def build_split_learning_components(args, device, inferred_num_patches=None):
     """
     构建 Split Learning 各组件:
     - 光学卫星客户端
@@ -498,7 +584,7 @@ def build_split_learning_components(args, device, inferred_num_patches):
         num_patches = (args.image_size // 8) ** 2
     else:
         num_patches = inferred_num_patches
-    # 根据所选数据集设置光学与雷达通道数
+
     if args.dataset == "whu":
         opt_ch = 4
         radar_ch = 1
@@ -536,12 +622,18 @@ def build_split_learning_components(args, device, inferred_num_patches):
     optical_client = OpticalSatelliteClient(
         optical_encoder=croma.optical_encoder,
         attn_bias=attn_bias,
+        encoder_dim=args.encoder_dim,
+        num_patches=num_patches,
+        num_classes=args.num_classes,
     ).to(device)
 
     # 构建雷达卫星客户端
     radar_client = RadarSatelliteClient(
         radar_encoder=croma.radar_encoder,
         attn_bias=attn_bias,
+        encoder_dim=args.encoder_dim,
+        num_patches=num_patches,
+        num_classes=args.num_classes,
     ).to(device)
 
     # 构建地面服务器
@@ -551,6 +643,13 @@ def build_split_learning_components(args, device, inferred_num_patches):
         num_patches=num_patches,
         num_classes=args.num_classes,
     ).to(device)
+
+    optical_client_params = sum(p.numel() for p in optical_client.parameters())
+    radar_client_params = sum(p.numel() for p in radar_client.parameters())
+    ground_server_params = sum(p.numel() for p in ground_server.parameters())
+    print(f"optical_client_params: {optical_client_params/1e6:.2f}M")
+    print(f"radar_client_params: {radar_client_params/1e6:.2f}M")
+    print(f"ground_server_params: {ground_server_params/1e6:.2f}M")
 
     return optical_client, radar_client, ground_server, attn_bias, num_patches
 
@@ -571,13 +670,15 @@ def train_one_epoch(
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
     else:
         criterion = nn.CrossEntropyLoss()
-
     total_loss = 0.0
+    total_server_ce_loss = 0.0
+    total_optical_kd_loss = 0.0
+    total_radar_kd_loss = 0.0
     num_pixels = 0
     trainer.stats.reset()
 
     for step, (optical, sar, labels) in enumerate(train_loader):
-        loss = trainer.train_step(
+        loss, server_ce_loss, optical_kd_loss, radar_kd_loss = trainer.train_step(
             optical_imgs=optical,
             radar_imgs=sar,
             labels=labels,
@@ -585,11 +686,15 @@ def train_one_epoch(
             radar_optimizer=radar_optimizer,
             server_optimizer=server_optimizer,
             criterion=criterion,
+            distill_temperature=args.distill_temperature,
             max_grad_norm=args.max_grad_norm,
         )
 
         batch_pixels = labels.numel()
         total_loss += loss * batch_pixels
+        total_server_ce_loss += server_ce_loss * batch_pixels
+        total_optical_kd_loss += optical_kd_loss * batch_pixels
+        total_radar_kd_loss += radar_kd_loss * batch_pixels
         num_pixels += batch_pixels
 
         if (step + 1) % args.log_interval == 0:
@@ -598,10 +703,28 @@ def train_one_epoch(
             comm_mb = trainer.stats.total_bytes() / (1024 * 1024)
             print(
                 f"[{elapsed_str}] Epoch {epoch} | Step {step+1}/{len(train_loader)} | "
-                f"Loss: {loss:.4f} | Comm: {comm_mb:.2f} MB"
+                f"Loss: {loss:.4f} | "
+                f"server_ce_loss: {server_ce_loss:.4f} | "
+                f"optical_kd_loss: {optical_kd_loss:.4f} | "
+                f"radar_kd_loss: {radar_kd_loss:.4f} | "
+                f"Comm: {comm_mb:.2f} MB"
             )
 
     avg_loss = total_loss / max(1, num_pixels)
+    avg_server_ce_loss = total_server_ce_loss / max(1, num_pixels)
+    avg_optical_kd_loss = total_optical_kd_loss / max(1, num_pixels)
+    avg_radar_kd_loss = total_radar_kd_loss / max(1, num_pixels)
+
+    elapsed = time.time() - start_time
+    elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+    print(
+        f"[{elapsed_str}] [Train] Epoch {epoch} | "
+        f"avg_loss: {avg_loss:.4f} | "
+        f"avg_server_ce_loss: {avg_server_ce_loss:.4f} | "
+        f"avg_optical_kd_loss: {avg_optical_kd_loss:.4f} | "
+        f"avg_radar_kd_loss: {avg_radar_kd_loss:.4f}"
+    )
+
     return avg_loss, trainer.stats.total_bytes()
 
 
@@ -670,7 +793,7 @@ def save_checkpoint(
         except OSError:
             pass
 
-    ckpt_path = os.path.join(run_dir, f"split_learning_checkpoint_epoch_{epoch}.pt")
+    ckpt_path = os.path.join(run_dir, f"distil_checkpoint_epoch_{epoch}.pt")
     torch.save(
         {
             "epoch": epoch,
@@ -698,12 +821,14 @@ def main():
 
     print(f"Device: {device}")
     print("=" * 60)
-    print("Split Learning 配置:")
-    print("  - 光学卫星: optical_encoder")
-    print("  - 雷达卫星: radar_encoder")
-    print("  - 地面服务器: cross_encoder + seg_head")
+    print("Distillation 配置:")
+    print("  - 光学卫星: optical_encoder + local seg_head")
+    print("  - 雷达卫星: radar_encoder + local seg_head")
+    print("  - 地面服务器: cross_encoder + seg_head (teacher)")
     print("=" * 60)
 
+    # BigEarthNet 使用 19 个有效类别（参见 datasets.CLASS_NAMES 和 label_mapping）
+    # 若未显式指定，则自动覆盖为 19，避免标签越界
     if args.dataset == "bigearthnet":
         num_be_classes = len(CLASS_NAMES)
         if args.num_classes != num_be_classes:
@@ -715,7 +840,7 @@ def main():
 
     # 构建 Split Learning 组件
     optical_client, radar_client, ground_server, attn_bias, num_patches = \
-        build_split_learning_components(args, device, inferred_num_patches)
+        build_split_learning_components(args, device, inferred_num_patches=inferred_num_patches)
 
     # 为每个组件创建独立优化器
     optical_optimizer = torch.optim.AdamW(
@@ -738,7 +863,7 @@ def main():
     )
 
     # 运行目录和指标文件
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{args.dataset}"
     run_dir = os.path.join(args.output_dir, run_timestamp)
     os.makedirs(run_dir, exist_ok=True)
     metrics_path = os.path.join(run_dir, "epoch_metrics.csv")

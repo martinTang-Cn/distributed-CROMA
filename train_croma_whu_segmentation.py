@@ -20,11 +20,22 @@ SAR_CHANNELS = 1
 
 
 class CROMASegmentation(nn.Module):
-    """使用预训练好的 CROMA 作为编码器的分割模型。"""
+    """使用预训练好的 CROMA 作为编码器的分割模型。
 
-    def __init__(self, croma_model: CROMA, num_classes: int):
+    支持三种输入模式：
+    - joint: 使用光学+雷达的联合编码 (原始实现)
+    - optical-only: 仅使用光学编码 optical_encodings 进行分割
+    - radar-only: 仅使用雷达编码 radar_encodings 进行分割
+    """
+
+    def __init__(self, croma_model: CROMA, num_classes: int, input_mode: str = "joint"):
         super().__init__()
         self.croma = croma_model
+
+        assert input_mode in {"joint", "optical-only", "radar-only"}, \
+            "input_mode 必须是 'joint'、'optical-only' 或 'radar-only'"
+        self.input_mode = input_mode
+
         dim = self.croma.encoder_dim
 
         # 假设 patch 在空间上是正方形网格
@@ -45,26 +56,41 @@ class CROMASegmentation(nn.Module):
 
         attn_bias = self.croma.attn_bias.to(device)
 
-        # 不使用 mask，直接提取完整 patch 编码
-        radar_encodings = self.croma.radar_encoder(
-            imgs=radar_imgs, attn_bias=attn_bias, mask_info=None
-        )  # [B, N, D]
-        optical_encodings = self.croma.optical_encoder(
-            imgs=optical_imgs, attn_bias=attn_bias, mask_info=None
-        )  # [B, N, D]
+        # 根据不同模式构造用于分割头的特征
+        if self.input_mode == "optical-only":
+            # 仅使用光学编码 optical_encodings 进行分割
+            optical_encodings = self.croma.optical_encoder(
+                imgs=optical_imgs, attn_bias=attn_bias, mask_info=None
+            )  # [B, N, D]
+            encodings_for_seg = optical_encodings
+        elif self.input_mode == "radar-only":
+            # 仅使用雷达编码 radar_encodings 进行分割
+            radar_encodings = self.croma.radar_encoder(
+                imgs=radar_imgs, attn_bias=attn_bias, mask_info=None
+            )  # [B, N, D]
+            encodings_for_seg = radar_encodings
+        else:  # joint
+            # 不使用 mask，直接提取完整 patch 编码并做跨模态融合
+            radar_encodings = self.croma.radar_encoder(
+                imgs=radar_imgs, attn_bias=attn_bias, mask_info=None
+            )  # [B, N, D]
+            optical_encodings = self.croma.optical_encoder(
+                imgs=optical_imgs, attn_bias=attn_bias, mask_info=None
+            )  # [B, N, D]
 
-        joint_encodings = self.croma.cross_encoder(
-            x=radar_encodings, context=optical_encodings, alibi=attn_bias
-        )  # [B, N, D]
+            joint_encodings = self.croma.cross_encoder(
+                x=radar_encodings, context=optical_encodings, alibi=attn_bias
+            )  # [B, N, D]
+            encodings_for_seg = joint_encodings
 
-        b, n, d = joint_encodings.shape
+        b, n, d = encodings_for_seg.shape
         assert (
             n == self.h_patches * self.w_patches
         ), "num_patches 与 h_patches*w_patches 不一致，请检查 image_size/patch_size 设置"
 
         # [B, N, D] -> [B, D, H_p, W_p]
         feat = (
-            joint_encodings.view(b, self.h_patches, self.w_patches, d)
+            encodings_for_seg.view(b, self.h_patches, self.w_patches, d)
             .permute(0, 3, 1, 2)
             .contiguous()
         )
@@ -86,7 +112,7 @@ def parse_args():
     parser.add_argument(
         "--data_root",
         type=str,
-        default="../whu-opt-sar",
+        default="/home/featurize/data/whu-opt-sar-dataset",
         help="WHU 光学-SAR 数据根目录，包含 optical/sar/lbl 子目录",
     )
     parser.add_argument(
@@ -106,6 +132,13 @@ def parse_args():
     parser.add_argument("--decoder_dim", type=int, default=512)
     parser.add_argument("--decoder_layers", type=int, default=1)
     parser.add_argument("--num_classes", type=int, default=8)
+    parser.add_argument(
+        "--input_mode",
+        type=str,
+        default="joint",
+        choices=["joint", "optical-only", "radar-only"],
+        help="输入模式：joint(光学+雷达联合)、optical-only(仅光学)、radar-only(仅雷达)",
+    )
     parser.add_argument(
         "--pretrained_ckpt",
         type=str,
@@ -225,7 +258,11 @@ def build_model(args, device):
 
     croma.to(device)
 
-    seg_model = CROMASegmentation(croma_model=croma, num_classes=args.num_classes)
+    seg_model = CROMASegmentation(
+        croma_model=croma,
+        num_classes=args.num_classes,
+        input_mode=args.input_mode,
+    )
     seg_model.to(device)
 
     return seg_model, num_patches
@@ -396,6 +433,8 @@ def main():
     # 本次运行独立目录和指标文件
     if rank == 0:
         run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 在时间戳后追加输入模式，便于区分不同模式的运行结果
+        run_timestamp = f"{run_timestamp}_{args.input_mode}"
         run_dir = os.path.join(args.output_dir, run_timestamp)
         os.makedirs(run_dir, exist_ok=True)
         metrics_path = os.path.join(run_dir, "epoch_metrics.csv")

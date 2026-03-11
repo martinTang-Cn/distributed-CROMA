@@ -19,7 +19,7 @@ SAR_CHANNELS = 1    # SAR通道数
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Pretrain CROMA on WHU Opt-SAR patches (no labels)")
-    parser.add_argument("--data_root", type=str, default="/home/featurize/data",
+    parser.add_argument("--data_root", type=str, default="/home/featurize/data/Houston2013",
                         help="WHU 光学-SAR 数据根目录，包含 optical/sar/lbl 子目录")
     parser.add_argument("--image_size", type=int, default=256,
                         help="WHU数据集中裁剪出来的图像尺寸，等于 WHUOptSarPatchDataset.patch_size")
@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--attention_heads", type=int, default=16)
     parser.add_argument("--decoder_dim", type=int, default=512)
     parser.add_argument("--decoder_layers", type=int, default=1)
-    parser.add_argument("--output_dir", type=str, default="/home/featurize/data/whu-opt-sar-dataset")
+    parser.add_argument("--output_dir", type=str, default="../CROMA_checkpoint/croma_whu_pretrain_checkpoints")
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--num_ratio", type=float, default=1.0,
                         help="使用多少比例的训练集（<1 代表子集，>1 代表有放回扩增）")

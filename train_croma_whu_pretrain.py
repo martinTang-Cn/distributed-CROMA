@@ -45,13 +45,13 @@ def parse_args():
                         help="滑动窗口步长与 image_size 的比例")
     parser.add_argument("--max_grad_norm", type=float, default=0.0,
                         help=">0 时启用梯度裁剪")
-    parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet"], default="whu",
-                        help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset")
+    parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet", "houston2013"], default="whu",
+                        help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset，'houston2013' 使用 Houston2013PatchDataset")
     return parser.parse_args()
 
 
 def create_loaders(args, rank, world_size, distributed):
-    # 支持 WHU 和 BigEarthNet 两种数据集
+    # 支持 WHU、BigEarthNet 和 Houston2013 三种数据集
     if args.dataset == "whu":
         train_set = WHUOptSarPatchDataset(
             root_dir=args.data_root,
@@ -67,7 +67,7 @@ def create_loaders(args, rank, world_size, distributed):
             stride_ratio=args.stride_ratio,
             num_ratio=1.0,
         )
-    else:  # bigearthnet
+    elif args.dataset == "bigearthnet":
         train_set = BigEarthNetDataset(
             root=args.data_root,
             split="train",
@@ -77,6 +77,19 @@ def create_loaders(args, rank, world_size, distributed):
             root=args.data_root,
             split="validation",
             ratio=1.0,
+        )
+    else:  # houston2013
+        train_set = Houston2013PatchDataset(
+            root_dir=args.data_root,
+            split="train",
+            patch_size=args.image_size,
+            stride=args.image_size,
+        )
+        val_set = Houston2013PatchDataset(
+            root_dir=args.data_root,
+            split="val",
+            patch_size=args.image_size,
+            stride=args.image_size,
         )
 
     if distributed:
@@ -143,9 +156,12 @@ def build_model(args, device, inferred_num_patches=None):
     if args.dataset == "whu":
         opt_ch = 4
         radar_ch = 1
-    else:  # bigearthnet
+    elif args.dataset == "bigearthnet":
         opt_ch = 10
         radar_ch = 2
+    else:  # houston2013
+        opt_ch = 10
+        radar_ch = 1
 
     model = CROMA(
         patch_size=8,

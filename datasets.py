@@ -816,7 +816,7 @@ class Houston2013PatchDataset(Dataset):
     """Houston2013 HSI + LiDAR patch dataset for sparse labels.
 
     Returns:
-        hsi: torch.FloatTensor, shape (144, patch_size, patch_size)
+        hsi: torch.FloatTensor, shape (hsi_pca_components, patch_size, patch_size)
         lidar: torch.FloatTensor, shape (1, patch_size, patch_size)
         label: torch.LongTensor, shape (patch_size, patch_size)
     """
@@ -833,6 +833,7 @@ class Houston2013PatchDataset(Dataset):
         return_coords: bool = False,
         normalize: bool = True,
         norm_type: str = "standard",
+        hsi_pca_components: int = 10,
     ) -> None:
         super().__init__()
 
@@ -849,6 +850,7 @@ class Houston2013PatchDataset(Dataset):
         self.return_coords = return_coords
         self.normalize = normalize
         self.norm_type = norm_type
+        self.hsi_pca_components = hsi_pca_components
         self.stats_save_dir = os.path.join('.', 'Statistical_data', 'Houston2013')
         self.hsi_mean = None
         self.hsi_std = None
@@ -873,32 +875,35 @@ class Houston2013PatchDataset(Dataset):
                 f"HSI={self.hsi.shape}, LiDAR={self.lidar.shape}, label={self.label.shape}."
             )
 
-        if self.normalize and self.norm_type == "standard":
-            hsi_file = "hsi_stats.csv"
-            lidar_file = "lidar_stats.csv"
+        hsi_file = "hsi_stats.csv"
+        lidar_file = "lidar_stats.csv"
 
-            hsi_stats = _load_stats_from_csv(self.stats_save_dir, hsi_file)
-            lidar_stats = _load_stats_from_csv(self.stats_save_dir, lidar_file)
+        hsi_stats = _load_stats_from_csv(self.stats_save_dir, hsi_file)
+        lidar_stats = _load_stats_from_csv(self.stats_save_dir, lidar_file)
 
-            if hsi_stats is not None and lidar_stats is not None:
-                self.hsi_mean, self.hsi_std = hsi_stats
-                self.lidar_mean, self.lidar_std = lidar_stats
-            else:
-                self.hsi_mean, self.hsi_std = self._compute_global_stats(self.hsi)
-                self.lidar_mean, self.lidar_std = self._compute_global_stats(self.lidar)
+        if hsi_stats is not None:
+            self.hsi_mean, self.hsi_std = hsi_stats
+        else:
+            self.hsi_mean, self.hsi_std = self._compute_global_stats(self.hsi)
+            _save_stats_to_csv(
+                self.stats_save_dir,
+                hsi_file,
+                self.hsi_mean,
+                self.hsi_std,
+            )
 
-                _save_stats_to_csv(
-                    self.stats_save_dir,
-                    hsi_file,
-                    self.hsi_mean,
-                    self.hsi_std,
-                )
-                _save_stats_to_csv(
-                    self.stats_save_dir,
-                    lidar_file,
-                    self.lidar_mean,
-                    self.lidar_std,
-                )
+        if lidar_stats is not None:
+            self.lidar_mean, self.lidar_std = lidar_stats
+        else:
+            self.lidar_mean, self.lidar_std = self._compute_global_stats(self.lidar)
+            _save_stats_to_csv(
+                self.stats_save_dir,
+                lidar_file,
+                self.lidar_mean,
+                self.lidar_std,
+            )
+
+        self.hsi = self._load_or_compute_hsi_pca(self.hsi_pca_components)
 
         self.patch_indices = self._build_patch_indices(h, w)
 
@@ -906,6 +911,45 @@ class Houston2013PatchDataset(Dataset):
         """Compute per-channel mean/std from a (C,H,W) array."""
         sum_c, sumsq_c, count = _update_channel_stats(None, None, 0, arr)
         return _finalize_channel_stats(sum_c, sumsq_c, count)
+
+    def _load_or_compute_hsi_pca(self, n_components: int) -> np.ndarray:
+        """Load cached HSI PCA result or compute PCA on channel-standardized HSI."""
+        if n_components <= 0:
+            raise ValueError("hsi_pca_components must be a positive integer.")
+
+        c, h, w = self.hsi.shape
+        if n_components > c:
+            raise ValueError(f"hsi_pca_components={n_components} cannot exceed channel count {c}.")
+
+        cache_file = os.path.join(self.stats_save_dir, f"hsi_pca_{n_components}.npy")
+        if os.path.exists(cache_file):
+            hsi_pca = np.load(cache_file)
+            if hsi_pca.shape == (n_components, h, w):
+                return hsi_pca.astype(np.float32, copy=False)
+
+        os.makedirs(self.stats_save_dir, exist_ok=True)
+
+        mean = np.asarray(self.hsi_mean, dtype=np.float32).reshape(c, 1, 1)
+        std = np.asarray(self.hsi_std, dtype=np.float32).reshape(c, 1, 1)
+        std = np.where(std == 0, 1.0, std)
+
+        # 先按通道标准化，再做 PCA 降维。
+        standardized = (self.hsi - mean) / std
+        flat = standardized.reshape(c, -1)
+        feature_mean = flat.mean(axis=1, keepdims=True)
+        centered = flat - feature_mean
+
+        n_pixels = centered.shape[1]
+        denom = float(max(n_pixels - 1, 1))
+        cov = (centered @ centered.T) / denom
+
+        eigvals, eigvecs = np.linalg.eigh(cov.astype(np.float64, copy=False))
+        order = np.argsort(eigvals)[::-1]
+        components = eigvecs[:, order[:n_components]].astype(np.float32, copy=False)
+
+        projected = (components.T @ centered).reshape(n_components, h, w).astype(np.float32, copy=False)
+        np.save(cache_file, projected)
+        return projected
 
     def _build_patch_indices(self, h: int, w: int) -> List[PatchIndex]:
         ps = self.patch_size
@@ -950,12 +994,6 @@ class Houston2013PatchDataset(Dataset):
         label = torch.from_numpy(label_np).long()
 
         if self.normalize:
-            hsi = _normalize_tensor(
-                hsi,
-                method=self.norm_type,
-                mean=self.hsi_mean if self.norm_type == "standard" else None,
-                std=self.hsi_std if self.norm_type == "standard" else None,
-            )
             lidar = _normalize_tensor(
                 lidar,
                 method=self.norm_type,

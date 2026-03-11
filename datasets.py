@@ -818,7 +818,7 @@ class Houston2013PatchDataset(Dataset):
     Returns:
         hsi: torch.FloatTensor, shape (hsi_pca_components, patch_size, patch_size)
         lidar: torch.FloatTensor, shape (1, patch_size, patch_size)
-        label: torch.LongTensor, shape (patch_size, patch_size)
+        label: torch.LongTensor, shape (patch_size, patch_size), value range [-1, 14]
     """
 
     def __init__(
@@ -991,7 +991,8 @@ class Houston2013PatchDataset(Dataset):
 
         hsi = torch.from_numpy(hsi_patch).float()
         lidar = torch.from_numpy(lidar_patch).float()
-        label = torch.from_numpy(label_np).long()
+        # Houston 原始标签为 0..15，其中 0 为未标注；整体减 1 后变为 -1..14。
+        label = torch.from_numpy(label_np).long() - 1
 
         if self.normalize:
             lidar = _normalize_tensor(

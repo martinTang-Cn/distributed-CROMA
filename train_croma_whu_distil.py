@@ -29,7 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from datasets import WHUOptSarPatchDataset, BigEarthNetDataset, CLASS_NAMES
+from datasets import WHUOptSarPatchDataset, BigEarthNetDataset, Houston2013PatchDataset, CLASS_NAMES
 from pretrain_croma import CROMA, get_alibi
 
 OPT_CHANNELS = 4
@@ -506,13 +506,13 @@ def parse_args():
     parser.add_argument("--stride_ratio", type=float, default=0.9)
     parser.add_argument("--max_grad_norm", type=float, default=0.0)
     parser.add_argument("--distill_temperature", type=float, default=1.0)
-    parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet"], default="whu",
-                        help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset")
+    parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet", "houston2013"], default="whu",
+                        help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset，'houston2013' 使用 Houston2013PatchDataset")
     return parser.parse_args()
 
 
 def create_loaders(args):
-    # 支持 WHU 和 BigEarthNet 两种数据集
+    # 支持 WHU、BigEarthNet 和 Houston2013 三种数据集
     if args.dataset == "whu":
         train_set = WHUOptSarPatchDataset(
             root_dir=args.data_root,
@@ -528,7 +528,7 @@ def create_loaders(args):
             stride_ratio=args.stride_ratio,
             num_ratio=1.0,
         )
-    else:  # bigearthnet
+    elif args.dataset == "bigearthnet":
         train_set = BigEarthNetDataset(
             root=args.data_root,
             split="train",
@@ -538,6 +538,19 @@ def create_loaders(args):
             root=args.data_root,
             split="validation",
             ratio=1.0,
+        )
+    else:  # houston2013
+        train_set = Houston2013PatchDataset(
+            root_dir=args.data_root,
+            split="train",
+            patch_size=args.image_size,
+            stride=args.image_size,
+        )
+        val_set = Houston2013PatchDataset(
+            root_dir=args.data_root,
+            split="val",
+            patch_size=args.image_size,
+            stride=args.image_size,
         )
 
     train_loader = DataLoader(
@@ -588,9 +601,12 @@ def build_split_learning_components(args, device, inferred_num_patches=None):
     if args.dataset == "whu":
         opt_ch = 4
         radar_ch = 1
-    else:  # bigearthnet
+    elif args.dataset == "bigearthnet":
         opt_ch = 10
         radar_ch = 2
+    else:  # houston2013
+        opt_ch = 10
+        radar_ch = 1
 
     # 构建完整 CROMA 以加载预训练权重
     croma = CROMA(
@@ -664,9 +680,10 @@ def train_one_epoch(
     epoch: int,
     start_time: float,
 ):
-    # 对 WHU 和 BigEarthNet 使用不同的损失设置
-    # BigEarthNet 中 label_mapping 会产生 -1（忽略类），需在损失中显式忽略
+    # BigEarthNet 与 Houston2013 都使用 ignore_index=-1。
     if args.dataset == "bigearthnet":
+        criterion = nn.CrossEntropyLoss(ignore_index=-1)
+    elif args.dataset == "houston2013":
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
     else:
         criterion = nn.CrossEntropyLoss()
@@ -737,8 +754,71 @@ def evaluate(
 ):
     if args.dataset == "bigearthnet":
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
+    elif args.dataset == "houston2013":
+        criterion = nn.CrossEntropyLoss(ignore_index=-1)
     else:
         criterion = nn.CrossEntropyLoss()
+
+    if args.dataset == "houston2013":
+        total_loss = 0.0
+        num_pixels = 0
+        num_eval_classes = args.num_classes  # 评估 0..14，-1 为未标注
+        conf = torch.zeros((num_eval_classes, num_eval_classes), device=trainer.device)
+
+        for optical, sar, labels in val_loader:
+            loss, preds = trainer.evaluate_step(optical, sar, labels, criterion)
+            labels = labels.to(trainer.device)
+
+            valid = labels != -1
+            valid_count = int(valid.sum().item())
+            if valid_count > 0:
+                y_true = labels[valid].long()
+                y_pred = preds[valid].long()
+
+                in_range = (
+                    (y_true >= 0) & (y_true < num_eval_classes) &
+                    (y_pred >= 0) & (y_pred < num_eval_classes)
+                )
+                y_true = y_true[in_range]
+                y_pred = y_pred[in_range]
+
+                if y_true.numel() > 0:
+                    idx = y_true * num_eval_classes + y_pred
+                    conf += torch.bincount(
+                        idx,
+                        minlength=num_eval_classes * num_eval_classes,
+                    ).reshape(num_eval_classes, num_eval_classes)
+
+            batch_pixels = labels.numel()
+            total_loss += loss * batch_pixels
+            num_pixels += batch_pixels
+
+        avg_loss = total_loss / max(1, num_pixels)
+
+        total = conf.sum()
+        if total > 0:
+            diag = torch.diag(conf)
+            oa = (diag.sum() / total).item()
+
+            per_class_total = conf.sum(dim=1)
+            valid_cls = per_class_total > 0
+            class_acc = torch.zeros_like(per_class_total)
+            class_acc[valid_cls] = diag[valid_cls] / per_class_total[valid_cls]
+            aa = class_acc[valid_cls].mean().item() if valid_cls.any() else 0.0
+
+            row_marginal = conf.sum(dim=1)
+            col_marginal = conf.sum(dim=0)
+            pe = (row_marginal * col_marginal).sum() / (total * total)
+            po = diag.sum() / total
+            kappa = ((po - pe) / (1 - pe)).item() if float(1 - pe) > 1e-12 else 0.0
+        else:
+            oa, aa, kappa = 0.0, 0.0, 0.0
+
+        elapsed = time.time() - start_time
+        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        print(f"[{elapsed_str}] [Val] Epoch {epoch} | Loss: {avg_loss:.4f} | OA: {oa:.4f} | AA: {aa:.4f} | Kappa: {kappa:.4f}")
+        return avg_loss, {"oa": oa, "aa": aa, "kappa": kappa}
+
     total_loss = 0.0
     num_pixels = 0
     num_classes = args.num_classes
@@ -769,7 +849,7 @@ def evaluate(
     elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
     print(f"[{elapsed_str}] [Val] Epoch {epoch} | Loss: {avg_loss:.4f} | mIoU: {miou:.4f}")
 
-    return avg_loss, miou
+    return avg_loss, {"miou": miou}
 
 
 def save_checkpoint(
@@ -834,6 +914,12 @@ def main():
         if args.num_classes != num_be_classes:
             print(f"[Info] BigEarthNet: 覆盖 num_classes 从 {args.num_classes} 到 {num_be_classes}")
             args.num_classes = num_be_classes
+    elif args.dataset == "houston2013":
+        # Houston2013 在数据集中已平移为 -1..14，其中 -1 是未标注（ignore）。
+        num_houston_classes = 15
+        if args.num_classes != num_houston_classes:
+            print(f"[Info] Houston2013: 覆盖 num_classes 从 {args.num_classes} 到 {num_houston_classes}")
+            args.num_classes = num_houston_classes
 
     train_loader, val_loader, inferred_num_patches = create_loaders(args)
     print(f"Train patches: {len(train_loader.dataset)}, Val patches: {len(val_loader.dataset)}")
@@ -880,29 +966,52 @@ def main():
         )
         total_comm_bytes += epoch_comm_bytes
 
-        val_loss, val_miou = evaluate(trainer, val_loader, args, epoch, start_time)
+        val_loss, val_metrics = evaluate(trainer, val_loader, args, epoch, start_time)
 
         # 记录指标
         file_exists = os.path.exists(metrics_path)
         with open(metrics_path, "a", newline="") as f:
             writer = csv.writer(f)
-            if not file_exists:
+            if args.dataset == "houston2013":
+                if not file_exists:
+                    writer.writerow([
+                        "epoch",
+                        "train_loss",
+                        "val_loss",
+                        "val_OA",
+                        "val_AA",
+                        "val_kappa",
+                        "epoch_comm_MB",
+                        "total_comm_MB",
+                    ])
                 writer.writerow([
-                    "epoch",
-                    "train_loss",
-                    "val_loss",
-                    "val_mIoU",
-                    "epoch_comm_MB",
-                    "total_comm_MB",
+                    epoch,
+                    float(train_loss),
+                    float(val_loss),
+                    float(val_metrics["oa"]),
+                    float(val_metrics["aa"]),
+                    float(val_metrics["kappa"]),
+                    epoch_comm_bytes / (1024 * 1024),
+                    total_comm_bytes / (1024 * 1024),
                 ])
-            writer.writerow([
-                epoch,
-                float(train_loss),
-                float(val_loss),
-                float(val_miou),
-                epoch_comm_bytes / (1024 * 1024),
-                total_comm_bytes / (1024 * 1024),
-            ])
+            else:
+                if not file_exists:
+                    writer.writerow([
+                        "epoch",
+                        "train_loss",
+                        "val_loss",
+                        "val_mIoU",
+                        "epoch_comm_MB",
+                        "total_comm_MB",
+                    ])
+                writer.writerow([
+                    epoch,
+                    float(train_loss),
+                    float(val_loss),
+                    float(val_metrics["miou"]),
+                    epoch_comm_bytes / (1024 * 1024),
+                    total_comm_bytes / (1024 * 1024),
+                ])
 
         last_ckpt_path = save_checkpoint(
             optical_client, radar_client, ground_server,

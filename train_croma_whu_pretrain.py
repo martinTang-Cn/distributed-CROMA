@@ -10,7 +10,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch import distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from datasets import WHUOptSarPatchDataset, BigEarthNetDataset
+from datasets import WHUOptSarPatchDataset, BigEarthNetDataset, Houston2013PatchDataset
 from pretrain_croma import CROMA, get_mask
 
 OPT_CHANNELS = 4  # 光谱通道数 

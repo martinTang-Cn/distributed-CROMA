@@ -47,6 +47,8 @@ def parse_args():
                         help=">0 时启用梯度裁剪")
     parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet", "houston2013"], default="whu",
                         help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset，'houston2013' 使用 Houston2013PatchDataset")
+    parser.add_argument("--resume_checkpoint", type=str, default="",
+                        help="可选：提供未完成训练的 checkpoint 路径，从该 epoch+1 继续训练")
     return parser.parse_args()
 
 
@@ -350,6 +352,29 @@ def init_distributed():
     return rank, world_size, local_rank, distributed
 
 
+def load_checkpoint_if_needed(model, optimizer, args, device, rank):
+    """按需加载 checkpoint，返回 start_epoch 和 checkpoint 路径。"""
+    if not args.resume_checkpoint:
+        return 1, None
+
+    ckpt_path = args.resume_checkpoint
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"resume checkpoint 不存在: {ckpt_path}")
+
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    last_epoch = int(checkpoint.get("epoch", 0))
+    start_epoch = last_epoch + 1
+
+    if rank == 0:
+        print(f"Resumed from checkpoint: {ckpt_path}")
+        print(f"Resume start epoch: {start_epoch}")
+
+    return start_epoch, ckpt_path
+
+
 def main():
     args = parse_args()
     rank, world_size, local_rank, distributed = init_distributed()
@@ -369,15 +394,20 @@ def main():
             print(f"Inferred num_patches from data: {inferred_num_patches}")
 
     model, num_patches = build_model(args, device, inferred_num_patches=inferred_num_patches)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    start_epoch, resumed_ckpt_path = load_checkpoint_if_needed(model, optimizer, args, device, rank)
+
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
     # 为本次运行创建独立的时间戳目录及指标文件路径（仅 rank 0 实际创建）
     if rank == 0:
-        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{args.dataset}"
-        run_dir = os.path.join(args.output_dir, run_timestamp)
+        if resumed_ckpt_path:
+            # 继续训练时沿用原 checkpoint 所在目录，保持日志与模型连续
+            run_dir = os.path.dirname(resumed_ckpt_path)
+        else:
+            run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{args.dataset}"
+            run_dir = os.path.join(args.output_dir, run_timestamp)
         os.makedirs(run_dir, exist_ok=True)
         metrics_path = os.path.join(run_dir, "epoch_metrics.csv")
     else:
@@ -387,9 +417,18 @@ def main():
     # 记录运行开始时间（用于日志中的已运行总时长）
     start_time = time.time()
 
-    last_ckpt_path = None
+    last_ckpt_path = resumed_ckpt_path
 
-    for epoch in range(1, args.epochs + 1):
+    if start_epoch > args.epochs:
+        if rank == 0:
+            print(
+                f"Checkpoint epoch 已达到 {start_epoch - 1}，不小于目标 epochs={args.epochs}，无需继续训练。"
+            )
+        if distributed:
+            dist.destroy_process_group()
+        return
+
+    for epoch in range(start_epoch, args.epochs + 1):
         # 分布式时需要设置 epoch，以确保各 rank 的 shuffle 一致
         if distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)

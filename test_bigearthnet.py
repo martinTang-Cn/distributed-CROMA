@@ -98,7 +98,7 @@ def to_pil(img_arr: np.ndarray) -> Image.Image:
 
 
 def main():
-    root = '/home/featurize/data'
+    root = 'F:\数据集\BigEarthNet'
 
     print('Initializing dataset from', root)
     ds = BigEarthNetDataset(root=root, split='train', ratio=1.0, seed=42)
@@ -110,7 +110,7 @@ def main():
         return
 
     # 使用 metadata 的第一行（固定为 0）以便复现
-    idx = 4326
+    idx = 3652
     print('Using first index (0) from metadata')
 
     sample = ds[idx]
@@ -185,8 +185,12 @@ def main():
     out_img.paste(pil_s1.convert('RGB'), (w + spacing, 0))
     out_img.paste(pil_target, ((w + spacing) * 2 - spacing, 0))
 
-    out_path = os.path.join(os.path.dirname(__file__), 's2_s1_target_comparison.png')
+    out_path = os.path.join(os.path.dirname(__file__), 'image', 's2_s1_target_comparison.png')
+    out_path_s2 = os.path.join(os.path.dirname(__file__), 'image', 's2.png')
+    out_path_s1 = os.path.join(os.path.dirname(__file__), 'image', 's1.png')
     out_img.save(out_path)
+    pil_s2.save(out_path_s2)
+    pil_s1.save(out_path_s1)
     print('Saved comparison image to', out_path)
 
 

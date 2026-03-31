@@ -9,9 +9,11 @@ Distillation 分割训练脚本（卫星-地面协同）
 训练流程:
 1. 卫星端前向传播，生成中间激活值
 2. 激活值传输到地面服务器（模拟通信）
-3. 服务器完成前向传播、监督损失计算并更新
-4. 服务器将预测 logits 回传给两个卫星客户端
-5. 两端客户端用本地预测与服务器预测做 KL 蒸馏更新
+3. 卫星端预测 logits 上行到地面服务器（模拟通信）
+4. 服务器完成前向传播、监督损失计算并更新
+5. 服务器将自己的预测 logits 下行回传给两个卫星客户端
+6. 服务器将“另一端卫星的预测 logits”转发给对端卫星（模拟通信）
+7. 两端卫星客户端同时用“服务器预测”和“对端卫星预测”做 KL 蒸馏更新
 
 注意: 该脚本用于分割训练，预训练阶段不使用。
 """
@@ -39,22 +41,42 @@ SAR_CHANNELS = 1
 @dataclass
 class SplitLearningStats:
     """记录训练通信统计"""
-    # 前向传播: 激活值传输 (卫星 -> 服务器)
+    # 上行: 激活值/预测传输 (卫星 -> 服务器)
     forward_optical_bytes: int = 0
     forward_radar_bytes: int = 0
-    # 服务器回传: 教师预测传输 (服务器 -> 卫星)
+    # 下行: 服务器/转发预测传输 (服务器 -> 卫星)
     backward_optical_bytes: int = 0
     backward_radar_bytes: int = 0
 
-    def add_forward(self, optical_act: torch.Tensor, radar_act: torch.Tensor):
-        """记录前向传播的激活值大小"""
+    def add_forward(
+        self,
+        optical_act: torch.Tensor,
+        radar_act: torch.Tensor,
+        optical_pred: Optional[torch.Tensor] = None,
+        radar_pred: Optional[torch.Tensor] = None,
+    ):
+        """记录上行通信量（激活值 + 可选的卫星端预测）。"""
         self.forward_optical_bytes += optical_act.numel() * optical_act.element_size()
         self.forward_radar_bytes += radar_act.numel() * radar_act.element_size()
+        if optical_pred is not None:
+            self.forward_optical_bytes += optical_pred.numel() * optical_pred.element_size()
+        if radar_pred is not None:
+            self.forward_radar_bytes += radar_pred.numel() * radar_pred.element_size()
 
-    def add_backward(self, optical_teacher_pred: torch.Tensor, radar_teacher_pred: torch.Tensor):
-        """记录服务器回传教师预测的通信量"""
+    def add_backward(
+        self,
+        optical_teacher_pred: torch.Tensor,
+        radar_teacher_pred: torch.Tensor,
+        optical_peer_pred: Optional[torch.Tensor] = None,
+        radar_peer_pred: Optional[torch.Tensor] = None,
+    ):
+        """记录下行通信量（服务器教师预测 + 可选的转发另一卫星预测）。"""
         self.backward_optical_bytes += optical_teacher_pred.numel() * optical_teacher_pred.element_size()
         self.backward_radar_bytes += radar_teacher_pred.numel() * radar_teacher_pred.element_size()
+        if optical_peer_pred is not None:
+            self.backward_optical_bytes += optical_peer_pred.numel() * optical_peer_pred.element_size()
+        if radar_peer_pred is not None:
+            self.backward_radar_bytes += radar_peer_pred.numel() * radar_peer_pred.element_size()
 
     def total_bytes(self) -> int:
         return (self.forward_optical_bytes + self.forward_radar_bytes +
@@ -210,6 +232,7 @@ class RadarSatelliteClient(nn.Module):
         logits_low = self.seg_head(feat)
         return F.interpolate(logits_low, size=output_size, mode="bilinear", align_corners=False)
 
+    
     def local_step(
         self,
         radar_imgs: torch.Tensor,
@@ -344,55 +367,45 @@ class SplitLearningTrainer:
         1. 卫星端前向传播
         2. 激活值传输到服务器（模拟）
         3. 服务器前向传播 + 损失计算
-        4. 服务器反向传播并更新参数
-        5. 服务器预测传回卫星（模拟）
-        6. 卫星端使用 KL 蒸馏更新本地参数
-        
-        Returns:
-            total_loss: 总损失（server_ce + optical_kd + radar_kd）
-            server_ce_loss: 服务器监督损失
-            optical_kd_loss: 光学客户端蒸馏损失
-            radar_kd_loss: 雷达客户端蒸馏损失
         """
         optical_imgs = optical_imgs.to(self.device, non_blocking=True)
         radar_imgs = radar_imgs.to(self.device, non_blocking=True)
         labels = labels.to(self.device, non_blocking=True)
         H, W = optical_imgs.shape[-2:]
 
-        # ========== 阶段 1: 卫星端前向传播 ==========
-        # 光学卫星
+        # ========== 阶段 1: 卫星端前向传播（只做一次前向） ==========
         self.optical_client.train()
         optical_encodings = self.optical_client(optical_imgs)
-        
-        # 雷达卫星
+        optical_student_logits = self.optical_client.predict(optical_encodings, output_size=(H, W))
+
         self.radar_client.train()
         radar_encodings = self.radar_client(radar_imgs)
+        radar_student_logits = self.radar_client.predict(radar_encodings, output_size=(H, W))
+
+        # ========== 阶段 1.5: 卫星预测上行到服务器（模拟通信） ==========
+        # 使用 detach() 模拟跨设备传输（切断梯度）
+        optical_pred_tx = optical_student_logits.detach()
+        radar_pred_tx = radar_student_logits.detach()
 
         # ========== 阶段 2: 激活值传输到服务器（模拟通信） ==========
-        # 在实际场景中，这里会有网络传输
-        # 我们使用 .detach() 模拟跨设备传输切断
         optical_act = optical_encodings.detach()
         radar_act = radar_encodings.detach()
-        
-        # 记录通信量
-        self.stats.add_forward(optical_act, radar_act)
+        self.stats.add_forward(optical_act, radar_act, optical_pred=optical_pred_tx, radar_pred=radar_pred_tx)
 
         # ========== 阶段 3: 服务器前向传播 + 损失计算 ==========
         self.ground_server.train()
         server_optimizer.zero_grad(set_to_none=True)
-        
         attn_bias = self.attn_bias.to(self.device)
         logits = self.ground_server(
             radar_encodings=radar_act,
             optical_encodings=optical_act,
             attn_bias=attn_bias,
-            output_size=(H, W)
+            output_size=(H, W),
         )
         server_ce_loss = criterion(logits, labels)
 
         # ========== 阶段 4: 服务器反向传播并更新参数 ==========
         server_ce_loss.backward()
-        
         if max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(self.ground_server.parameters(), max_grad_norm)
         server_optimizer.step()
@@ -400,20 +413,32 @@ class SplitLearningTrainer:
         teacher_logits = logits.detach()
 
         # ========== 阶段 5: 服务器预测传回卫星（模拟通信） ==========
-        self.stats.add_backward(teacher_logits, teacher_logits)
+        # 服务器把“自己的预测”以及“另一颗卫星的预测（转发）”下行给各自的卫星
+        optical_peer_logits_rx = radar_pred_tx
+        radar_peer_logits_rx = optical_pred_tx
+        self.stats.add_backward(
+            optical_teacher_pred=teacher_logits,
+            radar_teacher_pred=teacher_logits,
+            optical_peer_pred=optical_peer_logits_rx,
+            radar_peer_pred=radar_peer_logits_rx,
+        )
 
-        # ========== 阶段 6: 卫星端 KL 蒸馏更新 ==========
-        optical_kd_loss = self.optical_client.local_step(
-            optical_imgs=optical_imgs,
+        # ========== 阶段 6: 卫星端 KL 蒸馏更新（使用缓存的 student logits） ==========
+        optical_kd_loss = self._distill_and_update(
+            model=self.optical_client,
+            student_logits=optical_student_logits,
             teacher_logits=teacher_logits,
+            peer_logits=optical_peer_logits_rx,
             optimizer=optical_optimizer,
             temperature=distill_temperature,
             max_grad_norm=max_grad_norm,
         )
 
-        radar_kd_loss = self.radar_client.local_step(
-            radar_imgs=radar_imgs,
+        radar_kd_loss = self._distill_and_update(
+            model=self.radar_client,
+            student_logits=radar_student_logits,
             teacher_logits=teacher_logits,
+            peer_logits=radar_peer_logits_rx,
             optimizer=radar_optimizer,
             temperature=distill_temperature,
             max_grad_norm=max_grad_norm,
@@ -422,6 +447,34 @@ class SplitLearningTrainer:
         server_ce_loss_value = server_ce_loss.item()
         total_loss = server_ce_loss_value + optical_kd_loss + radar_kd_loss
         return total_loss, server_ce_loss_value, optical_kd_loss, radar_kd_loss
+
+    def _distill_and_update(
+        self,
+        model: nn.Module,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        peer_logits: Optional[torch.Tensor],
+        optimizer: torch.optim.Optimizer,
+        temperature: float = 1.0,
+        max_grad_norm: float = 0.0,
+    ) -> float:
+        """使用 student logits 与 teacher/peer logits 计算 KL 蒸馏并更新 model 的参数，返回标量 loss 值。"""
+        optimizer.zero_grad(set_to_none=True)
+        student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+        kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+
+        if peer_logits is not None:
+            peer_probs = F.softmax(peer_logits / temperature, dim=1)
+            kd_loss = kd_loss + F.kl_div(student_log_probs, peer_probs, reduction="batchmean")
+
+        kd_loss = kd_loss * (temperature ** 2)
+        kd_loss.backward()
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        return kd_loss.item()
 
     @torch.no_grad()
     def evaluate_step(

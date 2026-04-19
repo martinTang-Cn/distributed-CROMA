@@ -357,6 +357,7 @@ class SplitLearningTrainer:
         radar_optimizer: torch.optim.Optimizer,
         server_optimizer: torch.optim.Optimizer,
         criterion: nn.Module,
+        enable_distill: bool = False,
         distill_temperature: float = 1.0,
         max_grad_norm: float = 0.0,
     ) -> Tuple[float, float, float, float]:
@@ -376,16 +377,23 @@ class SplitLearningTrainer:
         # ========== 阶段 1: 卫星端前向传播（只做一次前向） ==========
         self.optical_client.train()
         optical_encodings = self.optical_client(optical_imgs)
-        optical_student_logits = self.optical_client.predict(optical_encodings, output_size=(H, W))
 
         self.radar_client.train()
         radar_encodings = self.radar_client(radar_imgs)
-        radar_student_logits = self.radar_client.predict(radar_encodings, output_size=(H, W))
+
+        optical_student_logits = None
+        radar_student_logits = None
+        if enable_distill:
+            optical_student_logits = self.optical_client.predict(optical_encodings, output_size=(H, W))
+            radar_student_logits = self.radar_client.predict(radar_encodings, output_size=(H, W))
 
         # ========== 阶段 1.5: 卫星预测上行到服务器（模拟通信） ==========
         # 使用 detach() 模拟跨设备传输（切断梯度）
-        optical_pred_tx = optical_student_logits.detach()
-        radar_pred_tx = radar_student_logits.detach()
+        optical_pred_tx = None
+        radar_pred_tx = None
+        if enable_distill:
+            optical_pred_tx = optical_student_logits.detach()
+            radar_pred_tx = radar_student_logits.detach()
 
         # ========== 阶段 2: 激活值传输到服务器（模拟通信） ==========
         optical_act = optical_encodings.detach()
@@ -412,37 +420,40 @@ class SplitLearningTrainer:
 
         teacher_logits = logits.detach()
 
-        # ========== 阶段 5: 服务器预测传回卫星（模拟通信） ==========
-        # 服务器把“自己的预测”以及“另一颗卫星的预测（转发）”下行给各自的卫星
-        optical_peer_logits_rx = radar_pred_tx
-        radar_peer_logits_rx = optical_pred_tx
-        self.stats.add_backward(
-            optical_teacher_pred=teacher_logits,
-            radar_teacher_pred=teacher_logits,
-            optical_peer_pred=optical_peer_logits_rx,
-            radar_peer_pred=radar_peer_logits_rx,
-        )
+        optical_kd_loss = 0.0
+        radar_kd_loss = 0.0
+        if enable_distill:
+            # ========== 阶段 5: 服务器预测传回卫星（模拟通信） ==========
+            # 服务器把“自己的预测”以及“另一颗卫星的预测（转发）”下行给各自的卫星
+            optical_peer_logits_rx = radar_pred_tx
+            radar_peer_logits_rx = optical_pred_tx
+            self.stats.add_backward(
+                optical_teacher_pred=teacher_logits,
+                radar_teacher_pred=teacher_logits,
+                optical_peer_pred=optical_peer_logits_rx,
+                radar_peer_pred=radar_peer_logits_rx,
+            )
 
-        # ========== 阶段 6: 卫星端 KL 蒸馏更新（使用缓存的 student logits） ==========
-        optical_kd_loss = self._distill_and_update(
-            model=self.optical_client,
-            student_logits=optical_student_logits,
-            teacher_logits=teacher_logits,
-            peer_logits=optical_peer_logits_rx,
-            optimizer=optical_optimizer,
-            temperature=distill_temperature,
-            max_grad_norm=max_grad_norm,
-        )
+            # ========== 阶段 6: 卫星端 KL 蒸馏更新（使用缓存的 student logits） ==========
+            optical_kd_loss = self._distill_and_update(
+                model=self.optical_client,
+                student_logits=optical_student_logits,
+                teacher_logits=teacher_logits,
+                peer_logits=optical_peer_logits_rx,
+                optimizer=optical_optimizer,
+                temperature=distill_temperature,
+                max_grad_norm=max_grad_norm,
+            )
 
-        radar_kd_loss = self._distill_and_update(
-            model=self.radar_client,
-            student_logits=radar_student_logits,
-            teacher_logits=teacher_logits,
-            peer_logits=radar_peer_logits_rx,
-            optimizer=radar_optimizer,
-            temperature=distill_temperature,
-            max_grad_norm=max_grad_norm,
-        )
+            radar_kd_loss = self._distill_and_update(
+                model=self.radar_client,
+                student_logits=radar_student_logits,
+                teacher_logits=teacher_logits,
+                peer_logits=radar_peer_logits_rx,
+                optimizer=radar_optimizer,
+                temperature=distill_temperature,
+                max_grad_norm=max_grad_norm,
+            )
 
         server_ce_loss_value = server_ce_loss.item()
         total_loss = server_ce_loss_value + optical_kd_loss + radar_kd_loss
@@ -527,7 +538,7 @@ def parse_args():
         help="WHU 光学-SAR 数据根目录",
     )
     parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
     
@@ -538,7 +549,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     
     parser.add_argument("--encoder_dim", type=int, default=768)
-    parser.add_argument("--encoder_layers", type=int, default=12)
+    parser.add_argument("--encoder_layers", type=int, default=6)
     parser.add_argument("--attention_heads", type=int, default=16)
     parser.add_argument("--decoder_dim", type=int, default=512)
     parser.add_argument("--decoder_layers", type=int, default=1)
@@ -559,6 +570,13 @@ def parse_args():
     parser.add_argument("--stride_ratio", type=float, default=0.9)
     parser.add_argument("--max_grad_norm", type=float, default=0.0)
     parser.add_argument("--distill_temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--disable_distill",
+        action="store_false",
+        dest="enable_distill",
+        help="关闭蒸馏（默认开启）",
+    )
+    parser.set_defaults(enable_distill=True)
     parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet", "houston2013"], default="whu",
                         help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset，'houston2013' 使用 Houston2013PatchDataset")
     return parser.parse_args()
@@ -756,6 +774,7 @@ def train_one_epoch(
             radar_optimizer=radar_optimizer,
             server_optimizer=server_optimizer,
             criterion=criterion,
+            enable_distill=args.enable_distill,
             distill_temperature=args.distill_temperature,
             max_grad_norm=args.max_grad_norm,
         )

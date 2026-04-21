@@ -388,6 +388,12 @@ class SplitLearningTrainer:
             optical_student_logits = self.optical_client.predict(optical_encodings, output_size=(H, W))
             radar_student_logits = self.radar_client.predict(radar_encodings, output_size=(H, W))
 
+        optical_student_logits = None
+        radar_student_logits = None
+        if enable_distill:
+            optical_student_logits = self.optical_client.predict(optical_encodings, output_size=(H, W))
+            radar_student_logits = self.radar_client.predict(radar_encodings, output_size=(H, W))
+
         # ========== 阶段 1.5: 卫星预测上行到服务器（模拟通信） ==========
         # 使用 detach() 模拟跨设备传输（切断梯度）
         optical_pred_tx = None
@@ -445,7 +451,26 @@ class SplitLearningTrainer:
                 temperature=distill_temperature,
                 max_grad_norm=max_grad_norm,
             )
+            # ========== 阶段 6: 卫星端 KL 蒸馏更新（使用缓存的 student logits） ==========
+            optical_kd_loss = self._distill_and_update(
+                model=self.optical_client,
+                student_logits=optical_student_logits,
+                teacher_logits=teacher_logits,
+                peer_logits=optical_peer_logits_rx,
+                optimizer=optical_optimizer,
+                temperature=distill_temperature,
+                max_grad_norm=max_grad_norm,
+            )
 
+            radar_kd_loss = self._distill_and_update(
+                model=self.radar_client,
+                student_logits=radar_student_logits,
+                teacher_logits=teacher_logits,
+                peer_logits=radar_peer_logits_rx,
+                optimizer=radar_optimizer,
+                temperature=distill_temperature,
+                max_grad_norm=max_grad_norm,
+            )
             radar_kd_loss = self._distill_and_update(
                 model=self.radar_client,
                 student_logits=radar_student_logits,
@@ -540,6 +565,7 @@ def parse_args():
     )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
     
@@ -550,6 +576,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     
     parser.add_argument("--encoder_dim", type=int, default=768)
+    parser.add_argument("--encoder_layers", type=int, default=6)
     parser.add_argument("--encoder_layers", type=int, default=6)
     parser.add_argument("--attention_heads", type=int, default=16)
     parser.add_argument("--decoder_dim", type=int, default=512)

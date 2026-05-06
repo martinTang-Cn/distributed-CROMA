@@ -93,12 +93,14 @@ def create_loaders(args, rank, world_size, distributed):
             split="train",
             patch_size=args.image_size,
             stride=args.image_size,
+            drop_empty=False
         )
         val_set = Houston2013PatchDataset(
             root_dir=args.data_root,
             split="val",
             patch_size=args.image_size,
             stride=args.image_size,
+            drop_empty=False
         )
 
     if distributed:

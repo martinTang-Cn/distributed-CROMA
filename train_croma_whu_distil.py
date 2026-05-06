@@ -577,7 +577,6 @@ def parse_args():
     
     parser.add_argument("--encoder_dim", type=int, default=768)
     parser.add_argument("--encoder_layers", type=int, default=6)
-    parser.add_argument("--encoder_layers", type=int, default=6)
     parser.add_argument("--attention_heads", type=int, default=16)
     parser.add_argument("--decoder_dim", type=int, default=512)
     parser.add_argument("--decoder_layers", type=int, default=1)

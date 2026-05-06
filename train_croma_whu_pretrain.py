@@ -51,6 +51,11 @@ def parse_args():
                         help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset，'houston2013' 使用 Houston2013PatchDataset")
     parser.add_argument("--resume_checkpoint", type=str, default="",
                         help="可选：提供未完成训练的 checkpoint 路径，从该 epoch+1 继续训练")
+    parser.add_argument(
+        "--save_final_only",
+        action="store_true",
+        help="只在训练全部完成后保存一次模型（默认每个 epoch 保存一次）",
+    )
     return parser.parse_args()
 
 
@@ -476,7 +481,11 @@ def main():
                 ])
 
         # 保存当前 epoch 模型，并删除上一个 epoch 的模型（仅 rank 0 实际执行）
-        last_ckpt_path = save_checkpoint(model, optimizer, args, epoch, rank, run_dir, last_ckpt_path)
+        if not args.save_final_only:
+            last_ckpt_path = save_checkpoint(model, optimizer, args, epoch, rank, run_dir, last_ckpt_path)
+
+    if args.save_final_only:
+        last_ckpt_path = save_checkpoint(model, optimizer, args, args.epochs, rank, run_dir, last_ckpt_path)
 
 
 if __name__ == "__main__":

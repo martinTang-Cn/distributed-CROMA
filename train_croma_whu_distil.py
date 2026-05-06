@@ -612,6 +612,11 @@ def parse_args():
     )
     parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet", "houston2013"], default="whu",
                         help="选择使用的数据集：'whu' 使用 WHUOptSarPatchDataset，'bigearthnet' 使用 BigEarthNetDataset，'houston2013' 使用 Houston2013PatchDataset")
+    parser.add_argument(
+        "--save_final_only",
+        action="store_true",
+        help="只在训练全部完成后保存一次模型（默认每个 epoch 保存一次）",
+    )
     return parser.parse_args()
 
 
@@ -1119,15 +1124,23 @@ def main():
                     total_comm_bytes / (1024 * 1024),
                 ])
 
-        last_ckpt_path = save_checkpoint(
-            optical_client, radar_client, ground_server,
-            optical_optimizer, radar_optimizer, server_optimizer,
-            args, epoch, run_dir, last_ckpt_path
-        )
+        if not args.save_final_only:
+            last_ckpt_path = save_checkpoint(
+                optical_client, radar_client, ground_server,
+                optical_optimizer, radar_optimizer, server_optimizer,
+                args, epoch, run_dir, last_ckpt_path
+            )
 
     print("=" * 60)
     print(f"训练完成! 总通信量: {total_comm_bytes / (1024 * 1024 * 1024):.2f} GB")
     print("=" * 60)
+
+    if args.save_final_only:
+        last_ckpt_path = save_checkpoint(
+            optical_client, radar_client, ground_server,
+            optical_optimizer, radar_optimizer, server_optimizer,
+            args, args.epochs, run_dir, last_ckpt_path
+        )
 
 
 if __name__ == "__main__":

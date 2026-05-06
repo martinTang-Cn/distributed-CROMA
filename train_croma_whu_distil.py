@@ -451,26 +451,7 @@ class SplitLearningTrainer:
                 temperature=distill_temperature,
                 max_grad_norm=max_grad_norm,
             )
-            # ========== 阶段 6: 卫星端 KL 蒸馏更新（使用缓存的 student logits） ==========
-            optical_kd_loss = self._distill_and_update(
-                model=self.optical_client,
-                student_logits=optical_student_logits,
-                teacher_logits=teacher_logits,
-                peer_logits=optical_peer_logits_rx,
-                optimizer=optical_optimizer,
-                temperature=distill_temperature,
-                max_grad_norm=max_grad_norm,
-            )
 
-            radar_kd_loss = self._distill_and_update(
-                model=self.radar_client,
-                student_logits=radar_student_logits,
-                teacher_logits=teacher_logits,
-                peer_logits=radar_peer_logits_rx,
-                optimizer=radar_optimizer,
-                temperature=distill_temperature,
-                max_grad_norm=max_grad_norm,
-            )
             radar_kd_loss = self._distill_and_update(
                 model=self.radar_client,
                 student_logits=radar_student_logits,

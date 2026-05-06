@@ -681,7 +681,7 @@ def create_loaders(args):
         # sample 返回 (optical, sar, ...) 其中 optical shape = (C, H, W)
         optical_sample = sample[0]
         _, H, W = optical_sample.shape
-        inferred_num_patches = (H // 8) * (W // 8)
+        inferred_num_patches = (H // args.vit_patch_size) * (W // args.vit_patch_size)
     except Exception:
         inferred_num_patches = None
 
@@ -697,8 +697,8 @@ def build_split_learning_components(args, device, inferred_num_patches=None):
     """
     # Prefer inferred_num_patches (from actual dataset samples) to avoid mismatch
     if inferred_num_patches is None:
-        assert args.image_size % 8 == 0, "image_size 必须能被 8 整除，以适配 CROMA 的 patch_size=8"
-        num_patches = (args.image_size // 8) ** 2
+        assert args.image_size % args.vit_patch_size == 0, "image_size 必须能被 8 整除，以适配 CROMA 的 patch_size=8"
+        num_patches = (args.image_size // args.vit_patch_size) ** 2
     else:
         num_patches = inferred_num_patches
 

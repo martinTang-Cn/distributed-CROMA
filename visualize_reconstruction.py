@@ -12,6 +12,7 @@ from pretrain_croma import CROMA, get_mask, apply_mask_to_alibi
 
 
 PATCH_SIZE = 8
+SUBPLOT_TITLE_SIZE = 20
 
 
 def parse_args():
@@ -25,7 +26,7 @@ def parse_args():
     parser.add_argument("--stride_ratio", type=float, default=0.9, help="WHU stride ratio")
     parser.add_argument("--mask_ratio_radar", type=float, default=0.75)
     parser.add_argument("--mask_ratio_optical", type=float, default=0.75)
-    parser.add_argument("--rgb_indices", type=str, default="2,1,0", help="Optical RGB channel indices")
+    parser.add_argument("--rgb_indices", type=str, default="1,2,0", help="Optical RGB channel indices")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="reconstruction_vis.png", help="Output image path")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
@@ -244,6 +245,11 @@ def patch_mask_to_image(mask_1d, image_hw, patch_size):
     return np.repeat(np.repeat(patch_mask, patch_size, axis=0), patch_size, axis=1)
 
 
+def mask_to_black_overlay(mask_img):
+    # masked=1 -> black(0), visible=0 -> white(1)
+    return 1.0 - mask_img
+
+
 def blend_visible_original(original, recon, patch_mask_img):
     if original.ndim == 3:
         patch_mask_img = patch_mask_img[None, ...]
@@ -310,19 +316,19 @@ def main():
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))
 
     axes[0, 0].imshow(optical_to_rgb(optical, args.rgb_indices))
-    axes[0, 0].set_title("Optical Original")
+    axes[0, 0].set_title("Optical Original", fontsize=SUBPLOT_TITLE_SIZE)
     axes[0, 0].axis("off")
 
     axes[0, 1].imshow(optical_to_rgb(recon_opt, args.rgb_indices))
-    axes[0, 1].set_title("Optical Reconstruction")
+    axes[0, 1].set_title("Optical Reconstruction", fontsize=SUBPLOT_TITLE_SIZE)
     axes[0, 1].axis("off")
 
     axes[0, 2].imshow(optical_to_rgb(torch.from_numpy(optical_hybrid), args.rgb_indices))
-    axes[0, 2].set_title("Optical Hybrid (visible=original)")
+    axes[0, 2].set_title("Optical Hybrid (visible=original)", fontsize=SUBPLOT_TITLE_SIZE)
     axes[0, 2].axis("off")
 
-    axes[0, 3].imshow(mask_opt_img, cmap="magma", vmin=0, vmax=1)
-    axes[0, 3].set_title("Optical Mask (1=masked)")
+    axes[0, 3].imshow(mask_to_black_overlay(mask_opt_img), cmap="gray", vmin=0, vmax=1)
+    axes[0, 3].set_title("Optical Mask (masked=black)", fontsize=SUBPLOT_TITLE_SIZE)
     axes[0, 3].axis("off")
 
     radar_orig_show, radar_orig_cmap = radar_to_display(radar)
@@ -330,24 +336,24 @@ def main():
     radar_hybrid_show, radar_hybrid_cmap = radar_to_display(torch.from_numpy(radar_hybrid))
 
     axes[1, 0].imshow(radar_orig_show, cmap=radar_orig_cmap)
-    axes[1, 0].set_title("Radar Original")
+    axes[1, 0].set_title("Radar Original", fontsize=SUBPLOT_TITLE_SIZE)
     axes[1, 0].axis("off")
 
     axes[1, 1].imshow(radar_rec_show, cmap=radar_rec_cmap)
-    axes[1, 1].set_title("Radar Reconstruction")
+    axes[1, 1].set_title("Radar Reconstruction", fontsize=SUBPLOT_TITLE_SIZE)
     axes[1, 1].axis("off")
 
     axes[1, 2].imshow(radar_hybrid_show, cmap=radar_hybrid_cmap)
-    axes[1, 2].set_title("Radar Hybrid (visible=original)")
+    axes[1, 2].set_title("Radar Hybrid (visible=original)", fontsize=SUBPLOT_TITLE_SIZE)
     axes[1, 2].axis("off")
 
-    axes[1, 3].imshow(mask_radar_img, cmap="magma", vmin=0, vmax=1)
-    axes[1, 3].set_title("Radar Mask (1=masked)")
+    axes[1, 3].imshow(mask_to_black_overlay(mask_radar_img), cmap="gray", vmin=0, vmax=1)
+    axes[1, 3].set_title("Radar Mask (masked=black)", fontsize=SUBPLOT_TITLE_SIZE)
     axes[1, 3].axis("off")
 
     fig.suptitle(
         f"Dataset={args.dataset}, idx={idx}, mask_ratio_opt={args.mask_ratio_optical}, mask_ratio_radar={args.mask_ratio_radar}",
-        fontsize=12,
+        fontsize=20,
     )
     plt.tight_layout()
 

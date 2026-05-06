@@ -162,7 +162,7 @@ def build_model(args, device, inferred_num_patches=None):
         opt_ch = 10
         radar_ch = 2
     else:  # houston2013
-        opt_ch = 10
+        opt_ch = 144
         radar_ch = 1
 
     model = CROMA(

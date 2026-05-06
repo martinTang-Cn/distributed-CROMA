@@ -709,7 +709,7 @@ def build_split_learning_components(args, device, inferred_num_patches=None):
         opt_ch = 10
         radar_ch = 2
     else:  # houston2013
-        opt_ch = 10
+        opt_ch = 144
         radar_ch = 1
 
     # 构建完整 CROMA 以加载预训练权重

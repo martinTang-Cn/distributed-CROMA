@@ -23,6 +23,8 @@ def parse_args():
                         help="WHU 光学-SAR 数据根目录，包含 optical/sar/lbl 子目录")
     parser.add_argument("--image_size", type=int, default=256,
                         help="WHU数据集中裁剪出来的图像尺寸，等于 WHUOptSarPatchDataset.patch_size")
+    parser.add_argument("--vit_patch_size", type=int, default=8,
+                        help="vit使用的patch_size")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -166,7 +168,7 @@ def build_model(args, device, inferred_num_patches=None):
         radar_ch = 1
 
     model = CROMA(
-        patch_size=8,
+        patch_size=args.vit_patch_size,
         encoder_dim=args.encoder_dim,
         encoder_layers=args.encoder_layers,
         attention_heads=args.attention_heads,

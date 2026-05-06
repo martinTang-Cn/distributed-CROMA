@@ -564,7 +564,7 @@ def parse_args():
         help="WHU 光学-SAR 数据根目录",
     )
     parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--vit_patch_size", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -714,7 +714,7 @@ def build_split_learning_components(args, device, inferred_num_patches=None):
 
     # 构建完整 CROMA 以加载预训练权重
     croma = CROMA(
-        patch_size=8,
+        patch_size=args.vit_patch_size,
         encoder_dim=args.encoder_dim,
         encoder_layers=args.encoder_layers,
         attention_heads=args.attention_heads,

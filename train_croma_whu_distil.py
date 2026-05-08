@@ -1030,6 +1030,17 @@ def main():
         ground_server.parameters(), lr=args.lr_server, weight_decay=args.weight_decay
     )
 
+    # 学习率调度器: 每 30 个 epoch 乘以 0.5
+    optical_scheduler = torch.optim.lr_scheduler.StepLR(
+        optical_optimizer, step_size=30, gamma=0.5
+    )
+    radar_scheduler = torch.optim.lr_scheduler.StepLR(
+        radar_optimizer, step_size=30, gamma=0.5
+    )
+    server_scheduler = torch.optim.lr_scheduler.StepLR(
+        server_optimizer, step_size=30, gamma=0.5
+    )
+
     # 创建训练协调器
     trainer = SplitLearningTrainer(
         optical_client=optical_client,
@@ -1110,6 +1121,10 @@ def main():
                 optical_optimizer, radar_optimizer, server_optimizer,
                 args, epoch, run_dir, last_ckpt_path
             )
+
+        optical_scheduler.step()
+        radar_scheduler.step()
+        server_scheduler.step()
 
     print("=" * 60)
     print(f"训练完成! 总通信量: {total_comm_bytes / (1024 * 1024 * 1024):.2f} GB")

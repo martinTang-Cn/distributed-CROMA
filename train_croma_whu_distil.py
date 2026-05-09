@@ -565,7 +565,7 @@ def parse_args():
     parser.add_argument(
         "--pretrained_ckpt",
         type=str,
-        required=True,
+        default=None,
         help="预训练 CROMA checkpoint 路径",
     )
     parser.add_argument(
@@ -578,6 +578,7 @@ def parse_args():
     parser.add_argument("--stride_ratio", type=float, default=0.9)
     parser.add_argument("--max_grad_norm", type=float, default=0.0)
     parser.add_argument("--distill_temperature", type=float, default=1.0)
+    parser.add_argument("--lr_step_size", type=int, default=30, help="StepLR 的 step_size")
     parser.add_argument(
         "--disable_distill",
         action="store_false",
@@ -711,14 +712,17 @@ def build_split_learning_components(args, device, inferred_num_patches=None):
         radar_channels=radar_ch,
     )
 
-    # 加载预训练权重
-    ckpt = torch.load(args.pretrained_ckpt, map_location="cpu")
-    state_dict = ckpt.get("model_state_dict", ckpt)
-    missing, unexpected = croma.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"[Warning] Missing keys: {missing}")
-    if unexpected:
-        print(f"[Warning] Unexpected keys: {unexpected}")
+    # 加载预训练权重（如未提供，则随机初始化）
+    if args.pretrained_ckpt:
+        ckpt = torch.load(args.pretrained_ckpt, map_location="cpu")
+        state_dict = ckpt.get("model_state_dict", ckpt)
+        missing, unexpected = croma.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[Warning] Missing keys: {missing}")
+        if unexpected:
+            print(f"[Warning] Unexpected keys: {unexpected}")
+    else:
+        print("[Info] pretrained_ckpt is None, using random initialization.")
 
     # 获取 attn_bias
     attn_bias = croma.attn_bias
@@ -1030,15 +1034,15 @@ def main():
         ground_server.parameters(), lr=args.lr_server, weight_decay=args.weight_decay
     )
 
-    # 学习率调度器: 每 30 个 epoch 乘以 0.5
+    # 学习率调度器: 每 lr_step_size 个 epoch 乘以 0.5
     optical_scheduler = torch.optim.lr_scheduler.StepLR(
-        optical_optimizer, step_size=30, gamma=0.5
+        optical_optimizer, step_size=args.lr_step_size, gamma=0.5
     )
     radar_scheduler = torch.optim.lr_scheduler.StepLR(
-        radar_optimizer, step_size=30, gamma=0.5
+        radar_optimizer, step_size=args.lr_step_size, gamma=0.5
     )
     server_scheduler = torch.optim.lr_scheduler.StepLR(
-        server_optimizer, step_size=30, gamma=0.5
+        server_optimizer, step_size=args.lr_step_size, gamma=0.5
     )
 
     # 创建训练协调器

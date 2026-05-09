@@ -56,6 +56,16 @@ def parse_args():
         action="store_true",
         help="只在训练全部完成后保存一次模型（默认每个 epoch 保存一次）",
     )
+    parser.add_argument(
+        "--disable_mae",
+        action="store_true",
+        help="关闭 MAE 重建损失",
+    )
+    parser.add_argument(
+        "--disable_contrast",
+        action="store_true",
+        help="关闭对比损失",
+    )
     return parser.parse_args()
 
 
@@ -224,6 +234,10 @@ def train_one_epoch(model, train_loader, optimizer, device, num_patches, args, e
             rank=rank,
             world_size=world_size,
         )
+        if args.disable_contrast:
+            contrast_loss = contrast_loss * 0.0
+        if args.disable_mae:
+            mae_loss = mae_loss * 0.0
         loss = contrast_loss + mae_loss
 
         optimizer.zero_grad(set_to_none=True)
@@ -285,6 +299,10 @@ def evaluate(model, val_loader, device, num_patches, args, epoch, rank, world_si
                 rank=rank,
                 world_size=world_size,
             )
+            if args.disable_contrast:
+                contrast_loss = contrast_loss * 0.0
+            if args.disable_mae:
+                mae_loss = mae_loss * 0.0
             loss = contrast_loss + mae_loss
 
             total_loss += loss.item() * bsz

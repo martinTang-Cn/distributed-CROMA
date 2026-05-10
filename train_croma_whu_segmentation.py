@@ -130,7 +130,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--encoder_dim", type=int, default=768)
-    parser.add_argument("--encoder_layers", type=int, default=12)
+    parser.add_argument("--encoder_layers", type=int, default=6)
     parser.add_argument("--attention_heads", type=int, default=16)
     parser.add_argument("--vit_patch_size", type=int, default=8, help="ViT patch size")
     parser.add_argument("--decoder_dim", type=int, default=512)
@@ -169,6 +169,11 @@ def parse_args():
     )
     parser.add_argument(
         "--max_grad_norm", type=float, default=0.0, help=">0 时启用梯度裁剪"
+    )
+    parser.add_argument(
+        "--save_final_only",
+        action="store_true",
+        help="只在训练全部完成后保存一次模型（默认每个 epoch 保存一次）",
     )
     return parser.parse_args()
 
@@ -352,10 +357,58 @@ def train_one_epoch(model, train_loader, optimizer, device, args, epoch, rank, w
         if rank == 0 and (step + 1) % args.log_interval == 0:
             elapsed = time.time() - start_time
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-            print(
-                f"[{elapsed_str}] Epoch {epoch} | Step {step+1}/{len(train_loader)} | "
-                f"Loss: {loss.item():.4f}"
-            )
+            if args.dataset == "houston2013":
+                with torch.no_grad():
+                    preds = torch.argmax(logits, dim=1)
+                    valid = labels != -1
+                    num_eval_classes = args.num_classes
+                    conf = torch.zeros((num_eval_classes, num_eval_classes), device=device)
+
+                    if valid.any():
+                        y_true = labels[valid].long()
+                        y_pred = preds[valid].long()
+                        in_range = (
+                            (y_true >= 0) & (y_true < num_eval_classes) &
+                            (y_pred >= 0) & (y_pred < num_eval_classes)
+                        )
+                        y_true = y_true[in_range]
+                        y_pred = y_pred[in_range]
+
+                        if y_true.numel() > 0:
+                            idx = y_true * num_eval_classes + y_pred
+                            conf = torch.bincount(
+                                idx,
+                                minlength=num_eval_classes * num_eval_classes,
+                            ).reshape(num_eval_classes, num_eval_classes)
+
+                    total = conf.sum()
+                    if total > 0:
+                        diag = torch.diag(conf)
+                        oa = (diag.sum() / total).item()
+
+                        per_class_total = conf.sum(dim=1)
+                        valid_cls = per_class_total > 0
+                        class_acc = torch.zeros_like(per_class_total)
+                        class_acc[valid_cls] = diag[valid_cls] / per_class_total[valid_cls]
+                        aa = class_acc[valid_cls].mean().item() if valid_cls.any() else 0.0
+
+                        row_marginal = conf.sum(dim=1)
+                        col_marginal = conf.sum(dim=0)
+                        pe = (row_marginal * col_marginal).sum() / (total * total)
+                        po = diag.sum() / total
+                        kappa = ((po - pe) / (1 - pe)).item() if float(1 - pe) > 1e-12 else 0.0
+                    else:
+                        oa, aa, kappa = 0.0, 0.0, 0.0
+
+                print(
+                    f"[{elapsed_str}] Epoch {epoch} | Step {step+1}/{len(train_loader)} | "
+                    f"Loss: {loss.item():.4f} | OA: {oa:.4f} | AA: {aa:.4f} | Kappa: {kappa:.4f}"
+                )
+            else:
+                print(
+                    f"[{elapsed_str}] Epoch {epoch} | Step {step+1}/{len(train_loader)} | "
+                    f"Loss: {loss.item():.4f}"
+                )
 
     avg_loss = total_loss / max(1, num_pixels)
     return avg_loss
@@ -367,6 +420,79 @@ def evaluate(model, val_loader, device, args, epoch, rank, world_size, start_tim
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
     else:
         criterion = nn.CrossEntropyLoss()
+
+    if args.dataset == "houston2013":
+        total_loss = 0.0
+        num_pixels = 0
+        num_eval_classes = args.num_classes
+        conf = torch.zeros((num_eval_classes, num_eval_classes), device=device)
+
+        with torch.no_grad():
+            for optical, sar, labels in val_loader:
+                optical = optical.to(device, non_blocking=True)
+                sar = sar.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+
+                imgs = torch.cat([optical, sar], dim=1)
+
+                logits = model(imgs)
+                loss = criterion(logits, labels)
+                preds = torch.argmax(logits, dim=1)
+
+                valid = labels != -1
+                valid_count = int(valid.sum().item())
+                if valid_count > 0:
+                    y_true = labels[valid].long()
+                    y_pred = preds[valid].long()
+
+                    in_range = (
+                        (y_true >= 0) & (y_true < num_eval_classes) &
+                        (y_pred >= 0) & (y_pred < num_eval_classes)
+                    )
+                    y_true = y_true[in_range]
+                    y_pred = y_pred[in_range]
+
+                    if y_true.numel() > 0:
+                        idx = y_true * num_eval_classes + y_pred
+                        conf += torch.bincount(
+                            idx,
+                            minlength=num_eval_classes * num_eval_classes,
+                        ).reshape(num_eval_classes, num_eval_classes)
+
+                batch_pixels = labels.numel()
+                total_loss += loss.item() * batch_pixels
+                num_pixels += batch_pixels
+
+        avg_loss = total_loss / max(1, num_pixels)
+
+        total = conf.sum()
+        if total > 0:
+            diag = torch.diag(conf)
+            oa = (diag.sum() / total).item()
+
+            per_class_total = conf.sum(dim=1)
+            valid_cls = per_class_total > 0
+            class_acc = torch.zeros_like(per_class_total)
+            class_acc[valid_cls] = diag[valid_cls] / per_class_total[valid_cls]
+            aa = class_acc[valid_cls].mean().item() if valid_cls.any() else 0.0
+
+            row_marginal = conf.sum(dim=1)
+            col_marginal = conf.sum(dim=0)
+            pe = (row_marginal * col_marginal).sum() / (total * total)
+            po = diag.sum() / total
+            kappa = ((po - pe) / (1 - pe)).item() if float(1 - pe) > 1e-12 else 0.0
+        else:
+            oa, aa, kappa = 0.0, 0.0, 0.0
+
+        if rank == 0:
+            elapsed = time.time() - start_time
+            elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+            print(
+                f"[{elapsed_str}] [Val] Epoch {epoch} | Loss: {avg_loss:.4f} | "
+                f"OA: {oa:.4f} | AA: {aa:.4f} | Kappa: {kappa:.4f}"
+            )
+
+        return avg_loss, {"oa": oa, "aa": aa, "kappa": kappa}
 
     total_loss = 0.0
     num_pixels = 0
@@ -413,7 +539,7 @@ def evaluate(model, val_loader, device, args, epoch, rank, world_size, start_tim
         elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
         print(f"[{elapsed_str}] [Val] Epoch {epoch} | Loss: {avg_loss:.4f} | mIoU: {miou:.4f}")
 
-    return avg_loss, miou
+    return avg_loss, {"miou": miou}
 
 
 def save_checkpoint(model, optimizer, args, epoch, rank, run_dir, last_ckpt_path=None):
@@ -523,7 +649,7 @@ def main():
             model, train_loader, optimizer, device, args, epoch, rank, world_size, start_time
         )
 
-        val_loss, val_miou = evaluate(
+        val_loss, val_metrics = evaluate(
             model, val_loader, device, args, epoch, rank, world_size, start_time
         )
 
@@ -531,22 +657,47 @@ def main():
             file_exists = os.path.exists(metrics_path)
             with open(metrics_path, "a", newline="") as f:
                 writer = csv.writer(f)
-                if not file_exists:
+                if args.dataset == "houston2013":
+                    if not file_exists:
+                        writer.writerow([
+                            "epoch",
+                            "train_loss",
+                            "val_loss",
+                            "val_OA",
+                            "val_AA",
+                            "val_kappa",
+                        ])
                     writer.writerow([
-                        "epoch",
-                        "train_loss",
-                        "val_loss",
-                        "val_mIoU",
+                        epoch,
+                        float(train_loss),
+                        float(val_loss),
+                        float(val_metrics["oa"]),
+                        float(val_metrics["aa"]),
+                        float(val_metrics["kappa"]),
                     ])
-                writer.writerow([
-                    epoch,
-                    float(train_loss),
-                    float(val_loss),
-                    float(val_miou),
-                ])
+                else:
+                    if not file_exists:
+                        writer.writerow([
+                            "epoch",
+                            "train_loss",
+                            "val_loss",
+                            "val_mIoU",
+                        ])
+                    writer.writerow([
+                        epoch,
+                        float(train_loss),
+                        float(val_loss),
+                        float(val_metrics["miou"]),
+                    ])
 
+        if not args.save_final_only:
+            last_ckpt_path = save_checkpoint(
+                model, optimizer, args, epoch, rank, run_dir, last_ckpt_path
+            )
+
+    if args.save_final_only:
         last_ckpt_path = save_checkpoint(
-            model, optimizer, args, epoch, rank, run_dir, last_ckpt_path
+            model, optimizer, args, args.epochs, rank, run_dir, last_ckpt_path
         )
 
 

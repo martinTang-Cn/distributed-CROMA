@@ -164,7 +164,7 @@ def parse_args():
     parser.add_argument(
         "--stride_ratio",
         type=float,
-        default=0.9,
+        default=1.0,
         help="滑动窗口步长与 image_size 的比例",
     )
     parser.add_argument(
@@ -383,13 +383,13 @@ def train_one_epoch(model, train_loader, optimizer, device, args, epoch, rank, w
 
                     total = conf.sum()
                     if total > 0:
-                        diag = torch.diag(conf)
+                        diag = torch.diag(conf).float()
                         oa = (diag.sum() / total).item()
 
                         per_class_total = conf.sum(dim=1)
                         valid_cls = per_class_total > 0
-                        class_acc = torch.zeros_like(per_class_total)
-                        class_acc[valid_cls] = diag[valid_cls] / per_class_total[valid_cls]
+                        class_acc = torch.zeros_like(per_class_total, dtype=torch.float32)
+                        class_acc[valid_cls] = diag[valid_cls] / per_class_total[valid_cls].float()
                         aa = class_acc[valid_cls].mean().item() if valid_cls.any() else 0.0
 
                         row_marginal = conf.sum(dim=1)
@@ -467,13 +467,13 @@ def evaluate(model, val_loader, device, args, epoch, rank, world_size, start_tim
 
         total = conf.sum()
         if total > 0:
-            diag = torch.diag(conf)
+            diag = torch.diag(conf).float()
             oa = (diag.sum() / total).item()
 
             per_class_total = conf.sum(dim=1)
             valid_cls = per_class_total > 0
-            class_acc = torch.zeros_like(per_class_total)
-            class_acc[valid_cls] = diag[valid_cls] / per_class_total[valid_cls]
+            class_acc = torch.zeros_like(per_class_total, dtype=torch.float32)
+            class_acc[valid_cls] = diag[valid_cls] / per_class_total[valid_cls].float()
             aa = class_acc[valid_cls].mean().item() if valid_cls.any() else 0.0
 
             row_marginal = conf.sum(dim=1)

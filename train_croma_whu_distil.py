@@ -577,7 +577,7 @@ def parse_args():
     parser.add_argument("--num_ratio", type=float, default=1.0)
     parser.add_argument("--stride_ratio", type=float, default=0.9)
     parser.add_argument("--max_grad_norm", type=float, default=0.0)
-    parser.add_argument("--distill_temperature", type=float, default=1.0)
+    parser.add_argument("--distill_temperature", type=float, default=5.0)
     parser.add_argument("--lr_step_size", type=int, default=30, help="StepLR 的 step_size")
     parser.add_argument(
         "--disable_distill",

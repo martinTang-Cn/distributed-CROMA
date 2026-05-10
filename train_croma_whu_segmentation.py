@@ -12,12 +12,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torch import distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from datasets import WHUOptSarPatchDataset
+from datasets import WHUOptSarPatchDataset, BigEarthNetDataset, Houston2013PatchDataset, CLASS_NAMES
 from pretrain_croma import CROMA
-
-OPT_CHANNELS = 4
-SAR_CHANNELS = 1
-
 
 class CROMASegmentation(nn.Module):
     """使用预训练好的 CROMA 作为编码器的分割模型。
@@ -116,6 +112,13 @@ def parse_args():
         help="WHU 光学-SAR 数据根目录，包含 optical/sar/lbl 子目录",
     )
     parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["whu-opt-sar", "bigearthnet", "houston2013"],
+        default="whu-opt-sar",
+        help="选择数据集：whu-opt-sar / bigearthnet / houston2013",
+    )
+    parser.add_argument(
         "--image_size",
         type=int,
         default=256,
@@ -129,6 +132,7 @@ def parse_args():
     parser.add_argument("--encoder_dim", type=int, default=768)
     parser.add_argument("--encoder_layers", type=int, default=12)
     parser.add_argument("--attention_heads", type=int, default=16)
+    parser.add_argument("--vit_patch_size", type=int, default=8, help="ViT patch size")
     parser.add_argument("--decoder_dim", type=int, default=512)
     parser.add_argument("--decoder_layers", type=int, default=1)
     parser.add_argument("--num_classes", type=int, default=8)
@@ -170,20 +174,45 @@ def parse_args():
 
 
 def create_loaders(args, rank, world_size, distributed):
-    train_set = WHUOptSarPatchDataset(
-        root_dir=args.data_root,
-        split="train",
-        patch_size=args.image_size,
-        stride_ratio=args.stride_ratio,
-        num_ratio=args.num_ratio,
-    )
-    val_set = WHUOptSarPatchDataset(
-        root_dir=args.data_root,
-        split="val",
-        patch_size=args.image_size,
-        stride_ratio=args.stride_ratio,
-        num_ratio=1.0,
-    )
+    if args.dataset == "whu-opt-sar":
+        train_set = WHUOptSarPatchDataset(
+            root_dir=args.data_root,
+            split="train",
+            patch_size=args.image_size,
+            stride_ratio=args.stride_ratio,
+            num_ratio=args.num_ratio,
+        )
+        val_set = WHUOptSarPatchDataset(
+            root_dir=args.data_root,
+            split="val",
+            patch_size=args.image_size,
+            stride_ratio=args.stride_ratio,
+            num_ratio=1.0,
+        )
+    elif args.dataset == "bigearthnet":
+        train_set = BigEarthNetDataset(
+            root=args.data_root,
+            split="train",
+            ratio=args.num_ratio,
+        )
+        val_set = BigEarthNetDataset(
+            root=args.data_root,
+            split="validation",
+            ratio=1.0,
+        )
+    else:  # houston2013
+        train_set = Houston2013PatchDataset(
+            root_dir=args.data_root,
+            split="train",
+            patch_size=args.image_size,
+            stride=args.image_size,
+        )
+        val_set = Houston2013PatchDataset(
+            root_dir=args.data_root,
+            split="val",
+            patch_size=args.image_size,
+            stride=args.image_size,
+        )
 
     if distributed:
         train_sampler = DistributedSampler(
@@ -224,27 +253,49 @@ def create_loaders(args, rank, world_size, distributed):
         drop_last=False,
     )
 
-    return train_loader, val_loader
+    inferred_num_patches = None
+    try:
+        sample = train_set[0]
+        optical_sample = sample[0]
+        _, H, W = optical_sample.shape
+        inferred_num_patches = (H // args.vit_patch_size) * (W // args.vit_patch_size)
+    except Exception:
+        inferred_num_patches = None
+
+    return train_loader, val_loader, inferred_num_patches
 
 
-def build_model(args, device):
-    assert (
-        args.image_size % 8 == 0
-    ), "image_size 必须能被 8 整除，以适配 CROMA 的 patch_size=8"
-    num_patches = (args.image_size // 8) ** 2
+def build_model(args, device, inferred_num_patches=None):
+    if inferred_num_patches is None:
+        assert (
+            args.image_size % args.vit_patch_size == 0
+        ), "image_size 必须能被 vit_patch_size 整除"
+        num_patches = (args.image_size // args.vit_patch_size) ** 2
+    else:
+        num_patches = inferred_num_patches
+
+    if args.dataset == "whu-opt-sar":
+        opt_ch = 4
+        radar_ch = 1
+    elif args.dataset == "bigearthnet":
+        opt_ch = 10
+        radar_ch = 2
+    else:  # houston2013
+        opt_ch = 144
+        radar_ch = 1
 
     # 构建与预训练阶段相同配置的 CROMA
     croma = CROMA(
-        patch_size=8,
+        patch_size=args.vit_patch_size,
         encoder_dim=args.encoder_dim,
         encoder_layers=args.encoder_layers,
         attention_heads=args.attention_heads,
         decoder_dim=args.decoder_dim,
         decoder_layers=args.decoder_layers,
-        total_channels=OPT_CHANNELS + SAR_CHANNELS,
+        total_channels=opt_ch + radar_ch,
         num_patches=num_patches,
-        opt_channels=OPT_CHANNELS,
-        radar_channels=SAR_CHANNELS,
+        opt_channels=opt_ch,
+        radar_channels=radar_ch,
     )
 
     # 加载预训练权重
@@ -270,7 +321,10 @@ def build_model(args, device):
 
 def train_one_epoch(model, train_loader, optimizer, device, args, epoch, rank, world_size, start_time):
     model.train()
-    criterion = nn.CrossEntropyLoss()
+    if args.dataset in {"bigearthnet", "houston2013"}:
+        criterion = nn.CrossEntropyLoss(ignore_index=-1)
+    else:
+        criterion = nn.CrossEntropyLoss()
 
     total_loss = 0.0
     num_pixels = 0
@@ -309,7 +363,10 @@ def train_one_epoch(model, train_loader, optimizer, device, args, epoch, rank, w
 
 def evaluate(model, val_loader, device, args, epoch, rank, world_size, start_time):
     model.eval()
-    criterion = nn.CrossEntropyLoss()
+    if args.dataset in {"bigearthnet", "houston2013"}:
+        criterion = nn.CrossEntropyLoss(ignore_index=-1)
+    else:
+        criterion = nn.CrossEntropyLoss()
 
     total_loss = 0.0
     num_pixels = 0
@@ -410,6 +467,17 @@ def main():
     args = parse_args()
     rank, world_size, local_rank, distributed = init_distributed()
 
+    if args.dataset == "bigearthnet":
+        num_be_classes = len(CLASS_NAMES)
+        if args.num_classes != num_be_classes:
+            print(f"[Info] BigEarthNet: 覆盖 num_classes 从 {args.num_classes} 到 {num_be_classes}")
+            args.num_classes = num_be_classes
+    elif args.dataset == "houston2013":
+        num_houston_classes = 15
+        if args.num_classes != num_houston_classes:
+            print(f"[Info] Houston2013: 覆盖 num_classes 从 {args.num_classes} 到 {num_houston_classes}")
+            args.num_classes = num_houston_classes
+
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
     else:
@@ -418,13 +486,15 @@ def main():
     if rank == 0:
         print(f"Distributed: {distributed}, world_size: {world_size}, device: {device}")
 
-    train_loader, val_loader = create_loaders(args, rank, world_size, distributed)
+    train_loader, val_loader, inferred_num_patches = create_loaders(
+        args, rank, world_size, distributed
+    )
     if rank == 0:
         print(
             f"Train patches: {len(train_loader.dataset)}, Val patches: {len(val_loader.dataset)}"
         )
 
-    model, _ = build_model(args, device)
+    model, _ = build_model(args, device, inferred_num_patches=inferred_num_patches)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 

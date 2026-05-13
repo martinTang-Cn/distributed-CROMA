@@ -164,7 +164,7 @@ def parse_args():
     parser.add_argument(
         "--stride_ratio",
         type=float,
-        default=1.0,
+        default=0.9,
         help="滑动窗口步长与 image_size 的比例",
     )
     parser.add_argument(

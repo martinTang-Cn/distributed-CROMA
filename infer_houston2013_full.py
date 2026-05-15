@@ -55,6 +55,19 @@ def parse_args():
     parser.add_argument("--output_npy", type=str, default="")
     parser.add_argument("--output_png", type=str, default="")
     parser.add_argument(
+        "--legend",
+        dest="legend",
+        action="store_true",
+        help="Add color legend to saved PNG output.",
+    )
+    parser.add_argument(
+        "--no-legend",
+        dest="legend",
+        action="store_false",
+        help="Save PNG output without color legend.",
+    )
+    parser.set_defaults(legend=True)
+    parser.add_argument(
         "--stats_dir",
         type=str,
         default=os.path.join(".", "Statistical_data", "Houston2013"),
@@ -182,7 +195,7 @@ def build_patch_indices(h: int, w: int, patch_size: int, stride: int) -> List[Tu
     return [(top, left) for top in top_starts for left in left_starts]
 
 
-def save_prediction_png(pred: np.ndarray, output_path: str):
+def save_prediction_png(pred: np.ndarray, output_path: str, include_legend: bool = True):
     palette = [
         
         31, 119, 180,
@@ -225,6 +238,10 @@ def save_prediction_png(pred: np.ndarray, output_path: str):
         pred = pred.astype(np.uint8)
     img = Image.fromarray(pred, mode="P")
     img.putpalette(palette)
+    if not include_legend:
+        img.save(output_path)
+        return
+
     rgb = img.convert("RGB")
 
     swatch_size = 16
@@ -351,7 +368,7 @@ def main():
             pred_png = pred.astype(np.uint16)
         else:
             pred_png = pred.astype(np.uint8)
-        save_prediction_png(pred_png, args.output_png)
+        save_prediction_png(pred_png, args.output_png, include_legend=args.legend)
 
     if args.output_npy:
         print(f"Saved prediction (npy): {args.output_npy}")

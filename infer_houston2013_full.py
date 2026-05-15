@@ -175,13 +175,24 @@ def infer_full_map(
         )
 
         logits_cpu = logits.cpu()
-        for i, c in enumerate(coords):
-            top = int(c["top"])
-            left = int(c["left"])
-            patch_h = logits_cpu.shape[-2]
-            patch_w = logits_cpu.shape[-1]
-            sum_logits[:, top : top + patch_h, left : left + patch_w] += logits_cpu[i]
-            count[top : top + patch_h, left : left + patch_w] += 1
+        if isinstance(coords, dict):
+            tops = coords["top"]
+            lefts = coords["left"]
+            for i in range(len(tops)):
+                top = int(tops[i])
+                left = int(lefts[i])
+                patch_h = logits_cpu.shape[-2]
+                patch_w = logits_cpu.shape[-1]
+                sum_logits[:, top : top + patch_h, left : left + patch_w] += logits_cpu[i]
+                count[top : top + patch_h, left : left + patch_w] += 1
+        else:
+            for i, c in enumerate(coords):
+                top = int(c["top"])
+                left = int(c["left"])
+                patch_h = logits_cpu.shape[-2]
+                patch_w = logits_cpu.shape[-1]
+                sum_logits[:, top : top + patch_h, left : left + patch_w] += logits_cpu[i]
+                count[top : top + patch_h, left : left + patch_w] += 1
 
     count = count.clamp_min(1)
     avg_logits = sum_logits / count.unsqueeze(0)

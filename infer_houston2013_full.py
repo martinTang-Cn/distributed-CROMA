@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import pandas as pd
 import rasterio
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from datasets import CASI_FILE, LIDAR_FILE
 from pretrain_croma import CROMA
@@ -195,7 +195,7 @@ def gaussian_weight(h: int, w: int, sigma_scale: float = 0.5) -> np.ndarray:
 
 def save_prediction_png(pred: np.ndarray, output_path: str):
     palette = [
-        0, 0, 0,
+        
         31, 119, 180,
         255, 127, 14,
         44, 160, 44,
@@ -211,11 +211,23 @@ def save_prediction_png(pred: np.ndarray, output_path: str):
         152, 223, 138,
         255, 152, 150,
         197, 176, 213,
-        196, 156, 148,
-        247, 182, 210,
-        199, 199, 199,
-        219, 219, 141,
-        158, 218, 229,
+    ]
+    labels = [
+        "健康的草",
+        "受压的草",
+        "合成草",
+        "树",
+        "土壤",
+        "水",
+        "居民区",
+        "商业区",
+        "道路",
+        "高速路",
+        "铁路",
+        "停车场1",
+        "停车场2",
+        "网球场",
+        "跑道",
     ]
     if len(palette) < 256 * 3:
         palette = palette + [0] * (256 * 3 - len(palette))
@@ -224,7 +236,27 @@ def save_prediction_png(pred: np.ndarray, output_path: str):
         pred = pred.astype(np.uint8)
     img = Image.fromarray(pred, mode="P")
     img.putpalette(palette)
-    img.save(output_path)
+    rgb = img.convert("RGB")
+
+    swatch_size = 16
+    pad = 6
+    text_pad = 6
+    legend_item_h = swatch_size + pad
+    legend_width = 220
+    legend_height = max(rgb.height, legend_item_h * len(labels) + pad)
+    canvas = Image.new("RGB", (rgb.width + legend_width, legend_height), (255, 255, 255))
+    canvas.paste(rgb, (0, 0))
+
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+    for i, label in enumerate(labels):
+        color = tuple(palette[i * 3 : i * 3 + 3])
+        y = pad + i * legend_item_h
+        x = rgb.width + pad
+        draw.rectangle([x, y, x + swatch_size, y + swatch_size], fill=color, outline=(0, 0, 0))
+        draw.text((x + swatch_size + text_pad, y), label, fill=(0, 0, 0), font=font)
+
+    canvas.save(output_path)
 
 
 @torch.no_grad()

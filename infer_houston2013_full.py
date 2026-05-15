@@ -182,17 +182,6 @@ def build_patch_indices(h: int, w: int, patch_size: int, stride: int) -> List[Tu
     return [(top, left) for top in top_starts for left in left_starts]
 
 
-def gaussian_weight(h: int, w: int, sigma_scale: float = 0.5) -> np.ndarray:
-    y = np.arange(h, dtype=np.float32)
-    x = np.arange(w, dtype=np.float32)
-    yy, xx = np.meshgrid(y, x, indexing="ij")
-    cy = (h - 1) / 2.0
-    cx = (w - 1) / 2.0
-    sigma = max(1.0, min(h, w) * sigma_scale)
-    weight = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * sigma * sigma))
-    return weight
-
-
 def save_prediction_png(pred: np.ndarray, output_path: str):
     palette = [
         
@@ -270,19 +259,17 @@ def infer_full_map(
     patch_indices: List[Tuple[int, int]],
     patch_size: int,
     num_classes: int,
-    weight_map: torch.Tensor,
     batch_size: int,
     device: torch.device,
 ) -> np.ndarray:
     h, w = hsi.shape[1:]
     sum_logits = torch.zeros((num_classes, h, w), dtype=torch.float32)
-    sum_weights = torch.zeros((h, w), dtype=torch.float32)
+    count = torch.zeros((h, w), dtype=torch.float32)
 
     optical_client.eval()
     radar_client.eval()
     ground_server.eval()
 
-    weight_map = weight_map.to(torch.float32)
     num_patches = len(patch_indices)
     for start in range(0, num_patches, batch_size):
         batch_indices = patch_indices[start : start + batch_size]
@@ -306,12 +293,11 @@ def infer_full_map(
 
         logits_cpu = logits.cpu()
         for i, (top, left) in enumerate(batch_indices):
-            weighted_logits = logits_cpu[i] * weight_map
-            sum_logits[:, top : top + patch_size, left : left + patch_size] += weighted_logits
-            sum_weights[top : top + patch_size, left : left + patch_size] += weight_map
+            sum_logits[:, top : top + patch_size, left : left + patch_size] += logits_cpu[i]
+            count[top : top + patch_size, left : left + patch_size] += 1
 
-    sum_weights = sum_weights.clamp_min(1e-6)
-    avg_logits = sum_logits / sum_weights.unsqueeze(0)
+    count = count.clamp_min(1e-6)
+    avg_logits = sum_logits / count.unsqueeze(0)
     pred = torch.argmax(avg_logits, dim=0).to(torch.int16).numpy()
     return pred
 
@@ -339,9 +325,6 @@ def main():
     radar_client.load_state_dict(radar_state, strict=True)
     ground_server.load_state_dict(server_state, strict=True)
 
-    weight_np = gaussian_weight(image_size, image_size, sigma_scale=0.5)
-    weight_map = torch.from_numpy(weight_np)
-
     pred = infer_full_map(
         optical_client,
         radar_client,
@@ -352,7 +335,6 @@ def main():
         patch_indices,
         image_size,
         num_classes,
-        weight_map,
         args.batch_size,
         device,
     )

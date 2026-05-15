@@ -77,6 +77,8 @@ def build_models(args, ckpt_args: Optional[dict], num_patches: int, device: torc
     decoder_layers = _pick_int(args.decoder_layers, ckpt_args, "decoder_layers", 1)
     num_classes = _pick_int(args.num_classes, ckpt_args, "num_classes", 15)
 
+    print("num_classes", num_classes)
+
     croma = CROMA(
         patch_size=vit_patch_size,
         encoder_dim=encoder_dim,
@@ -193,21 +195,27 @@ def gaussian_weight(h: int, w: int, sigma_scale: float = 0.5) -> np.ndarray:
 
 def save_prediction_png(pred: np.ndarray, output_path: str):
     palette = [
-        0, 0, 0,        # class 0
-        230, 25, 75,    # class 1
-        60, 180, 75,    # class 2
-        255, 225, 25,   # class 3
-        0, 130, 200,    # class 4
-        245, 130, 48,   # class 5
-        145, 30, 180,   # class 6
-        70, 240, 240,   # class 7
-        240, 50, 230,   # class 8
-        210, 245, 60,   # class 9
-        250, 190, 190,  # class 10
-        0, 128, 128,    # class 11
-        230, 190, 255,  # class 12
-        170, 110, 40,   # class 13
-        255, 250, 200,  # class 14
+        0, 0, 0,
+        31, 119, 180,
+        255, 127, 14,
+        44, 160, 44,
+        214, 39, 40,
+        148, 103, 189,
+        140, 86, 75,
+        227, 119, 194,
+        127, 127, 127,
+        188, 189, 34,
+        23, 190, 207,
+        174, 199, 232,
+        255, 187, 120,
+        152, 223, 138,
+        255, 152, 150,
+        197, 176, 213,
+        196, 156, 148,
+        247, 182, 210,
+        199, 199, 199,
+        219, 219, 141,
+        158, 218, 229,
     ]
     if len(palette) < 256 * 3:
         palette = palette + [0] * (256 * 3 - len(palette))

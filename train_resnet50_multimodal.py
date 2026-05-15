@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--max_grad_norm", type=float, default=0.0)
     parser.add_argument("--pretrained", action="store_true")
-    parser.add_argument("--output_dir", type=str, default="./resnet50_checkpoints")
+    parser.add_argument("--output_dir", type=str, default="../resnet50_checkpoints")
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--val_interval", type=int, default=1)
     parser.add_argument("--save_best_only", action="store_true")

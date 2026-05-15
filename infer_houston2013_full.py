@@ -1,13 +1,14 @@
 import argparse
 import os
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import pandas as pd
+import rasterio
 from PIL import Image
 
-from datasets import Houston2013PatchDataset, CASI_FILE
+from datasets import CASI_FILE, LIDAR_FILE
 from pretrain_croma import CROMA
 from train_croma_whu_distil import OpticalSatelliteClient, RadarSatelliteClient, GroundServer
 
@@ -35,7 +36,12 @@ def parse_args():
     parser.add_argument("--data_root", type=str, required=True, help="Houston2013 root directory")
     parser.add_argument("--split", type=str, default="val", choices=["train", "val"], help="Label split to infer")
     parser.add_argument("--image_size", type=int, default=None, help="Patch size used in training")
-    parser.add_argument("--stride", type=int, default=None, help="Stride for sliding window (default = image_size)")
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="Stride for sliding window (default = image_size//2)",
+    )
     parser.add_argument("--vit_patch_size", type=int, default=None, help="ViT patch size used in training")
     parser.add_argument("--encoder_dim", type=int, default=None)
     parser.add_argument("--encoder_layers", type=int, default=None)
@@ -48,6 +54,12 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output_npy", type=str, default="")
     parser.add_argument("--output_png", type=str, default="")
+    parser.add_argument(
+        "--stats_dir",
+        type=str,
+        default=os.path.join(".", "Statistical_data", "Houston2013"),
+        help="Directory containing hsi_stats.csv and lidar_stats.csv",
+    )
     parser.add_argument(
         "--save_original_label_space",
         action="store_true",
@@ -117,6 +129,68 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     return checkpoint, ckpt_args, optical_state, radar_state, server_state
 
 
+def load_stats(stats_dir: str, filename: str) -> Tuple[np.ndarray, np.ndarray]:
+    csv_path = os.path.join(stats_dir, filename)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Stats file not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    if "mean" not in df.columns or "std" not in df.columns:
+        raise ValueError(f"Stats CSV missing mean/std columns: {csv_path}")
+    mean = df["mean"].to_numpy(dtype=np.float32)
+    std = df["std"].to_numpy(dtype=np.float32)
+    std[std == 0] = 1.0
+    return mean, std
+
+
+def standardize_array(arr: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    if arr.ndim != 3:
+        raise ValueError(f"Expected (C,H,W) array, got {arr.shape}.")
+    mean = mean.reshape(-1, 1, 1)
+    std = std.reshape(-1, 1, 1)
+    return (arr - mean) / std
+
+
+def load_full_houston(data_root: str, stats_dir: str) -> Tuple[np.ndarray, np.ndarray]:
+    with rasterio.open(os.path.join(data_root, CASI_FILE)) as ds:
+        hsi = ds.read().astype(np.float32)
+    with rasterio.open(os.path.join(data_root, LIDAR_FILE)) as ds:
+        lidar = ds.read().astype(np.float32)
+
+    hsi_mean, hsi_std = load_stats(stats_dir, "hsi_stats.csv")
+    lidar_mean, lidar_std = load_stats(stats_dir, "lidar_stats.csv")
+
+    hsi = standardize_array(hsi, hsi_mean, hsi_std)
+    lidar = standardize_array(lidar, lidar_mean, lidar_std)
+
+    return hsi, lidar
+
+
+def build_patch_indices(h: int, w: int, patch_size: int, stride: int) -> List[Tuple[int, int]]:
+    def build_starts(length: int) -> List[int]:
+        if length <= patch_size:
+            return [0]
+        starts = list(range(0, length - patch_size + 1, stride))
+        last = length - patch_size
+        if starts[-1] != last:
+            starts.append(last)
+        return starts
+
+    top_starts = build_starts(h)
+    left_starts = build_starts(w)
+    return [(top, left) for top in top_starts for left in left_starts]
+
+
+def gaussian_weight(h: int, w: int, sigma_scale: float = 0.5) -> np.ndarray:
+    y = np.arange(h, dtype=np.float32)
+    x = np.arange(w, dtype=np.float32)
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    cy = (h - 1) / 2.0
+    cx = (w - 1) / 2.0
+    sigma = max(1.0, min(h, w) * sigma_scale)
+    weight = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * sigma * sigma))
+    return weight
+
+
 def save_prediction_png(pred: np.ndarray, output_path: str):
     palette = [
         0, 0, 0,        # class 0
@@ -151,51 +225,53 @@ def infer_full_map(
     radar_client: RadarSatelliteClient,
     ground_server: GroundServer,
     attn_bias: torch.Tensor,
-    loader: DataLoader,
-    full_size: Tuple[int, int],
+    hsi: np.ndarray,
+    lidar: np.ndarray,
+    patch_indices: List[Tuple[int, int]],
+    patch_size: int,
     num_classes: int,
+    weight_map: torch.Tensor,
+    batch_size: int,
     device: torch.device,
 ) -> np.ndarray:
-    h, w = full_size
+    h, w = hsi.shape[1:]
     sum_logits = torch.zeros((num_classes, h, w), dtype=torch.float32)
-    count = torch.zeros((h, w), dtype=torch.int32)
+    sum_weights = torch.zeros((h, w), dtype=torch.float32)
 
     optical_client.eval()
     radar_client.eval()
     ground_server.eval()
 
-    for optical, lidar, _, coords in loader:
-        optical = optical.to(device, non_blocking=True)
-        lidar = lidar.to(device, non_blocking=True)
+    weight_map = weight_map.to(torch.float32)
+    num_patches = len(patch_indices)
+    for start in range(0, num_patches, batch_size):
+        batch_indices = patch_indices[start : start + batch_size]
+        optical_batch = []
+        lidar_batch = []
+        for top, left in batch_indices:
+            hsi_patch = hsi[:, top : top + patch_size, left : left + patch_size]
+            lidar_patch = lidar[:, top : top + patch_size, left : left + patch_size]
+            optical_batch.append(torch.from_numpy(hsi_patch))
+            lidar_batch.append(torch.from_numpy(lidar_patch))
+
+        optical_tensor = torch.stack(optical_batch).to(device, non_blocking=True)
+        lidar_tensor = torch.stack(lidar_batch).to(device, non_blocking=True)
+
         logits = ground_server(
-            radar_encodings=radar_client(lidar),
-            optical_encodings=optical_client(optical),
+            radar_encodings=radar_client(lidar_tensor),
+            optical_encodings=optical_client(optical_tensor),
             attn_bias=attn_bias.to(device),
-            output_size=optical.shape[-2:],
+            output_size=(patch_size, patch_size),
         )
 
         logits_cpu = logits.cpu()
-        if isinstance(coords, dict):
-            tops = coords["top"]
-            lefts = coords["left"]
-            for i in range(len(tops)):
-                top = int(tops[i])
-                left = int(lefts[i])
-                patch_h = logits_cpu.shape[-2]
-                patch_w = logits_cpu.shape[-1]
-                sum_logits[:, top : top + patch_h, left : left + patch_w] += logits_cpu[i]
-                count[top : top + patch_h, left : left + patch_w] += 1
-        else:
-            for i, c in enumerate(coords):
-                top = int(c["top"])
-                left = int(c["left"])
-                patch_h = logits_cpu.shape[-2]
-                patch_w = logits_cpu.shape[-1]
-                sum_logits[:, top : top + patch_h, left : left + patch_w] += logits_cpu[i]
-                count[top : top + patch_h, left : left + patch_w] += 1
+        for i, (top, left) in enumerate(batch_indices):
+            weighted_logits = logits_cpu[i] * weight_map
+            sum_logits[:, top : top + patch_size, left : left + patch_size] += weighted_logits
+            sum_weights[top : top + patch_size, left : left + patch_size] += weight_map
 
-    count = count.clamp_min(1)
-    avg_logits = sum_logits / count.unsqueeze(0)
+    sum_weights = sum_weights.clamp_min(1e-6)
+    avg_logits = sum_logits / sum_weights.unsqueeze(0)
     pred = torch.argmax(avg_logits, dim=0).to(torch.int16).numpy()
     return pred
 
@@ -207,33 +283,13 @@ def main():
     checkpoint, ckpt_args, optical_state, radar_state, server_state = load_checkpoint(args.checkpoint, device)
 
     image_size = _pick_int(args.image_size, ckpt_args, "image_size", 256)
-    stride = args.stride if args.stride is not None else image_size
+    stride = args.stride if args.stride is not None else max(1, image_size // 2)
 
-    dataset = Houston2013PatchDataset(
-        root_dir=args.data_root,
-        split=args.split,
-        patch_size=image_size,
-        stride=stride,
-        drop_empty=False,
-        return_coords=True,
-        normalize=True,
-        norm_type="standard",
-    )
+    hsi, lidar = load_full_houston(args.data_root, args.stats_dir)
+    patch_indices = build_patch_indices(hsi.shape[1], hsi.shape[2], image_size, stride)
 
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    sample = dataset[0][0]
-    _, patch_h, patch_w = sample.shape
-    num_patches = (patch_h // _pick_int(args.vit_patch_size, ckpt_args, "vit_patch_size", 8)) * (
-        patch_w // _pick_int(args.vit_patch_size, ckpt_args, "vit_patch_size", 8)
-    )
+    vit_patch = _pick_int(args.vit_patch_size, ckpt_args, "vit_patch_size", 8)
+    num_patches = (image_size // vit_patch) * (image_size // vit_patch)
 
     optical_client, radar_client, ground_server, attn_bias, num_classes = build_models(
         args, ckpt_args, num_patches, device
@@ -243,15 +299,21 @@ def main():
     radar_client.load_state_dict(radar_state, strict=True)
     ground_server.load_state_dict(server_state, strict=True)
 
-    full_h, full_w = dataset.label.shape
+    weight_np = gaussian_weight(image_size, image_size, sigma_scale=0.5)
+    weight_map = torch.from_numpy(weight_np)
+
     pred = infer_full_map(
         optical_client,
         radar_client,
         ground_server,
         attn_bias,
-        loader,
-        (full_h, full_w),
+        hsi,
+        lidar,
+        patch_indices,
+        image_size,
         num_classes,
+        weight_map,
+        args.batch_size,
         device,
     )
 

@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument(
         "--stride",
         type=int,
-        default=None,
+        default=1,
         help="Stride for sliding window (default = image_size//2)",
     )
     parser.add_argument("--vit_patch_size", type=int, default=None, help="ViT patch size used in training")
@@ -280,8 +280,7 @@ def infer_full_map(
     device: torch.device,
 ) -> np.ndarray:
     h, w = hsi.shape[1:]
-    sum_logits = torch.zeros((num_classes, h, w), dtype=torch.float32)
-    count = torch.zeros((h, w), dtype=torch.float32)
+    vote_counts = torch.zeros((num_classes, h, w), dtype=torch.int32)
 
     optical_client.eval()
     radar_client.eval()
@@ -309,13 +308,15 @@ def infer_full_map(
         )
 
         logits_cpu = logits.cpu()
+        pred_batch = torch.argmax(logits_cpu, dim=1)
         for i, (top, left) in enumerate(batch_indices):
-            sum_logits[:, top : top + patch_size, left : left + patch_size] += logits_cpu[i]
-            count[top : top + patch_size, left : left + patch_size] += 1
+            patch_pred = pred_batch[i]
+            for cls in range(num_classes):
+                mask = patch_pred == cls
+                if mask.any():
+                    vote_counts[cls, top : top + patch_size, left : left + patch_size] += mask.to(torch.int32)
 
-    count = count.clamp_min(1e-6)
-    avg_logits = sum_logits / count.unsqueeze(0)
-    pred = torch.argmax(avg_logits, dim=0).to(torch.int16).numpy()
+    pred = torch.argmax(vote_counts, dim=0).to(torch.int16).numpy()
     return pred
 
 

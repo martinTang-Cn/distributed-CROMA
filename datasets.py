@@ -952,6 +952,12 @@ class Houston2013PatchDataset(Dataset):
         label = torch.from_numpy(label_np).long() - 1
 
         if self.normalize:
+            hsi = _normalize_tensor(
+                hsi,
+                method=self.norm_type,
+                mean=self.hsi_mean if self.norm_type == "standard" else None,
+                std=self.hsi_std if self.norm_type == "standard" else None,
+            )
             lidar = _normalize_tensor(
                 lidar,
                 method=self.norm_type,

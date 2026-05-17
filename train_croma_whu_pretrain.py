@@ -30,6 +30,10 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--step_size", type=int, default=60,
+                        help="StepLR 的 step_size")
+    parser.add_argument("--gamma", type=float, default=0.5,
+                        help="StepLR 的 gamma")
     parser.add_argument("--mask_ratio_radar", type=float, default=0.75,
                         help="雷达分支 MAE 掩码比例")
     parser.add_argument("--mask_ratio_optical", type=float, default=0.75,
@@ -422,6 +426,7 @@ def main():
 
     model, num_patches = build_model(args, device, inferred_num_patches=inferred_num_patches)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
     start_epoch, resumed_ckpt_path = load_checkpoint_if_needed(model, optimizer, args, device, rank)
 
     if distributed:
@@ -503,6 +508,8 @@ def main():
         # 保存当前 epoch 模型，并删除上一个 epoch 的模型（仅 rank 0 实际执行）
         if not args.save_final_only:
             last_ckpt_path = save_checkpoint(model, optimizer, args, epoch, rank, run_dir, last_ckpt_path)
+
+        scheduler.step()
 
     if args.save_final_only:
         last_ckpt_path = save_checkpoint(model, optimizer, args, args.epochs, rank, run_dir, last_ckpt_path)

@@ -8,7 +8,7 @@ import pandas as pd
 import rasterio
 from PIL import Image, ImageDraw, ImageFont
 
-from datasets import CASI_FILE, LIDAR_FILE
+from datasets import CASI_FILE, LIDAR_FILE, Houston2013PatchDataset
 from pretrain_croma import CROMA
 from train_croma_whu_distil import OpticalSatelliteClient, RadarSatelliteClient, GroundServer
 
@@ -265,6 +265,67 @@ def save_prediction_png(pred: np.ndarray, output_path: str, include_legend: bool
     canvas.save(output_path)
 
 
+def evaluate_val_accuracy(
+    pred: np.ndarray,
+    data_root: str,
+    patch_size: int,
+    num_classes: int,
+    batch_size: int,
+    num_workers: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    dataset = Houston2013PatchDataset(
+        root_dir=data_root,
+        split="val",
+        patch_size=patch_size,
+        stride=patch_size,
+        drop_empty=False,
+        return_coords=True,
+        normalize=False,
+        norm_type="standard",
+    )
+
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    correct = torch.zeros(num_classes, dtype=torch.int64)
+    total = torch.zeros(num_classes, dtype=torch.int64)
+    pred_tensor = torch.from_numpy(pred)
+
+    for _, _, labels, coords in loader:
+        if isinstance(coords, dict):
+            tops = coords["top"]
+            lefts = coords["left"]
+        else:
+            tops = [c["top"] for c in coords]
+            lefts = [c["left"] for c in coords]
+
+        for i in range(len(tops)):
+            top = int(tops[i])
+            left = int(lefts[i])
+            label_patch = labels[i]
+            pred_patch = pred_tensor[top : top + patch_size, left : left + patch_size]
+
+            valid = (label_patch >= 0) & (label_patch < num_classes)
+            if not valid.any():
+                continue
+
+            label_valid = label_patch[valid].view(-1).long()
+            pred_valid = pred_patch[valid].view(-1).long()
+
+            total += torch.bincount(label_valid, minlength=num_classes)
+            correct += torch.bincount(
+                label_valid[pred_valid == label_valid], minlength=num_classes
+            )
+
+    return correct.numpy(), total.numpy()
+
+
 @torch.no_grad()
 def infer_full_map(
     optical_client: OpticalSatelliteClient,
@@ -370,6 +431,22 @@ def main():
         else:
             pred_png = pred.astype(np.uint8)
         save_prediction_png(pred_png, args.output_png, include_legend=args.legend)
+
+    correct, total = evaluate_val_accuracy(
+        pred,
+        args.data_root,
+        image_size,
+        num_classes,
+        args.batch_size,
+        args.num_workers,
+    )
+    print("Per-class accuracy (val):")
+    for cls in range(num_classes):
+        if total[cls] == 0:
+            acc = 0.0
+        else:
+            acc = float(correct[cls]) / float(total[cls])
+        print(f"  class {cls}: {acc:.4f} ({int(correct[cls])}/{int(total[cls])})")
 
     if args.output_npy:
         print(f"Saved prediction (npy): {args.output_npy}")

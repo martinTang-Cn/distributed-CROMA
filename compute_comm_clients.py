@@ -32,8 +32,8 @@ def build_components(
     opt_channels: int,
     radar_channels: int,
     image_size: int = 256,
-    vit_patch_size: int = 8,
-    encoder_dim: int = 768,
+    vit_patch_size: int = 1,
+    encoder_dim: int = 192,
     encoder_layers: int = 6,
     attention_heads: int = 16,
     decoder_dim: int = 512,
@@ -160,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compute communication volume for one optical+radar pair",
     )
-    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--enable_distill", action="store_true", help="include teacher logits downlink")
     parser.add_argument(

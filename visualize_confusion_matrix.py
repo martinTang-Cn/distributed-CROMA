@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from datasets import (
     WHUOptSarPatchDataset,
@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max_batches", type=int, default=0, help="0 means all batches")
+    parser.add_argument("--eval_ratio", type=float, default=1.0, help="Use a subset of val set (0,1]")
     parser.add_argument("--output_dir", type=str, default="confusion_outputs")
     return parser.parse_args()
 
@@ -237,6 +238,37 @@ def _save_csv(conf: np.ndarray, class_names: List[str], out_path: str):
             writer.writerow([class_names[i]] + row.tolist())
 
 
+def _save_precision_csv(conf: np.ndarray, class_names: List[str], out_path: str):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    col_sum = conf.sum(axis=0)
+    row_sum = conf.sum(axis=1)
+    diag = np.diag(conf)
+
+    precision = np.zeros_like(col_sum, dtype=np.float64)
+    recall = np.zeros_like(row_sum, dtype=np.float64)
+
+    valid_prec = col_sum > 0
+    valid_rec = row_sum > 0
+
+    precision[valid_prec] = diag[valid_prec] / col_sum[valid_prec]
+    recall[valid_rec] = diag[valid_rec] / row_sum[valid_rec]
+
+    f1 = np.zeros_like(diag, dtype=np.float64)
+    valid_f1 = (precision + recall) > 0
+    f1[valid_f1] = 2 * precision[valid_f1] * recall[valid_f1] / (precision[valid_f1] + recall[valid_f1])
+
+    mean_precision = precision[valid_prec].mean() if np.any(valid_prec) else 0.0
+    mean_recall = recall[valid_rec].mean() if np.any(valid_rec) else 0.0
+    mean_f1 = f1[valid_f1].mean() if np.any(valid_f1) else 0.0
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["class", "precision", "recall", "f1"])
+        for name, p, r, f1_val in zip(class_names, precision.tolist(), recall.tolist(), f1.tolist()):
+            writer.writerow([name, f"{p:.6f}", f"{r:.6f}", f"{f1_val:.6f}"])
+        writer.writerow(["mean_macro", f"{mean_precision:.6f}", f"{mean_recall:.6f}", f"{mean_f1:.6f}"])
+
+
 def _plot_confusion(conf: np.ndarray, class_names: List[str], out_path: str, normalize: bool):
     if normalize:
         row_sum = conf.sum(axis=1, keepdims=True)
@@ -272,6 +304,14 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
 
     dataset, opt_ch, radar_ch, default_num_classes, class_names, ignore_index = _get_dataset(args)
+    if args.eval_ratio <= 0 or args.eval_ratio > 1.0:
+        raise ValueError("eval_ratio must be in (0, 1].")
+    if args.eval_ratio < 1.0:
+        total = len(dataset)
+        target = max(1, int(total * args.eval_ratio))
+        rng = np.random.RandomState(42)
+        indices = rng.choice(total, size=target, replace=False)
+        dataset = Subset(dataset, indices.tolist())
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -322,12 +362,15 @@ def main():
     csv_path = os.path.join(args.output_dir, f"{prefix}_confusion.csv")
     png_counts = os.path.join(args.output_dir, f"{prefix}_confusion_counts.png")
     png_norm = os.path.join(args.output_dir, f"{prefix}_confusion_norm.png")
+    precision_csv = os.path.join(args.output_dir, f"{prefix}_precision.csv")
 
     _save_csv(conf_np, class_names, csv_path)
+    _save_precision_csv(conf_np, class_names, precision_csv)
     _plot_confusion(conf_np, class_names, png_counts, normalize=False)
     _plot_confusion(conf_np, class_names, png_norm, normalize=True)
 
     print(f"Saved confusion matrix CSV: {csv_path}")
+    print(f"Saved per-class precision CSV: {precision_csv}")
     print(f"Saved confusion matrix (counts): {png_counts}")
     print(f"Saved confusion matrix (normalized): {png_norm}")
 

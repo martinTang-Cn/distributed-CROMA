@@ -21,9 +21,9 @@ from pretrain_croma import CROMA
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate distillation checkpoints on test splits")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to distillation checkpoint (.pt)")
-    parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet", "houston2013"], required=True)
-    parser.add_argument("--data_root", type=str, required=True, help="Dataset root path")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to distillation checkpoint (.pt)")
+    parser.add_argument("--dataset", type=str, choices=["whu", "bigearthnet", "houston2013"], default="whu")
+    parser.add_argument("--data_root", type=str, default=None, help="Dataset root path")
     parser.add_argument("--split", type=str, default=None, help="Dataset split override")
     parser.add_argument("--image_size", type=int, default=None)
     parser.add_argument("--vit_patch_size", type=int, default=None)
@@ -59,6 +59,12 @@ def parse_args():
         help="Use a subset of the dataset (0 < ratio <= 1)",
     )
     parser.add_argument("--eval_seed", type=int, default=42, help="Seed for subset sampling")
+    parser.add_argument(
+        "--confusion_csv",
+        type=str,
+        default=None,
+        help="Path to confusion matrix CSV; skip evaluation and plot directly",
+    )
     return parser.parse_args()
 
 
@@ -262,9 +268,14 @@ def _normalize_confusion(conf: torch.Tensor, mode: str) -> torch.Tensor:
     return conf_float / (denom + 1e-6)
 
 
-def save_confusion_matrix(conf: torch.Tensor, args, class_names: Optional[list] = None) -> str:
+def save_confusion_matrix(
+    conf: torch.Tensor,
+    args,
+    class_names: Optional[list] = None,
+    pre_normalized: bool = False,
+) -> str:
     conf_cpu = conf.detach().to("cpu")
-    conf_norm = _normalize_confusion(conf_cpu, args.confusion_normalize)
+    conf_norm = conf_cpu.float() if pre_normalized else _normalize_confusion(conf_cpu, args.confusion_normalize)
 
     num_classes = conf_cpu.shape[0]
     if not class_names or len(class_names) != num_classes:
@@ -313,9 +324,59 @@ def save_confusion_csv(conf: torch.Tensor, args, class_names: Optional[list] = N
     return path
 
 
+def load_confusion_csv(path: str) -> Tuple[torch.Tensor, list, str]:
+    with open(path, "r", newline="") as f:
+        rows = list(csv.reader(f))
+
+    if not rows:
+        raise ValueError("Confusion CSV is empty.")
+
+    normalize = "none"
+    start_idx = 0
+    if len(rows[0]) >= 2 and rows[0][0].strip().lower() == "normalize":
+        normalize = rows[0][1].strip().lower() or "none"
+        start_idx = 1
+
+    if len(rows) <= start_idx:
+        raise ValueError("Confusion CSV missing header row.")
+
+    header = rows[start_idx]
+    if len(header) < 2:
+        raise ValueError("Confusion CSV header is invalid.")
+    class_names = header[1:]
+
+    data_rows = rows[start_idx + 1 :]
+    if not data_rows:
+        raise ValueError("Confusion CSV has no matrix rows.")
+
+    values = []
+    for row in data_rows:
+        if len(row) < 2:
+            continue
+        values.append([float(x) for x in row[1:]])
+
+    if not values:
+        raise ValueError("Confusion CSV contains no numeric values.")
+
+    conf = torch.tensor(values, dtype=torch.float32)
+    return conf, class_names, normalize
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+
+    if args.confusion_csv:
+        conf, class_names, normalize = load_confusion_csv(args.confusion_csv)
+        args.confusion_normalize = normalize
+        out_path = save_confusion_matrix(conf, args, class_names, pre_normalized=True)
+        print(f"Confusion matrix saved to: {out_path}")
+        return
+
+    if not args.checkpoint:
+        raise ValueError("--checkpoint is required unless --confusion_csv is provided.")
+    if not args.data_root:
+        raise ValueError("--data_root is required unless --confusion_csv is provided.")
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     ckpt_args = ckpt.get("args", {})
@@ -358,7 +419,7 @@ def main():
 
     if args.plot_confusion:
         if args.dataset == "bigearthnet":
-            class_names = CLASS_NAMES
+            class_names = None
         elif args.dataset == "houston2013":
             class_names = None
         else:

@@ -424,7 +424,7 @@ def main():
 
     if args.plot_confusion:
         if args.dataset == "bigearthnet":
-            class_names = None
+            class_names = [str(i) for i in range(args.num_classes)]
         elif args.dataset == "houston2013":
             class_names = None
         else:

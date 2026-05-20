@@ -246,9 +246,14 @@ def evaluate(loader, optical_client, radar_client, ground_server, device, num_cl
 def _resolve_confusion_path(args) -> str:
     if args.confusion_path:
         return args.confusion_path
-    ckpt_name = os.path.splitext(os.path.basename(args.checkpoint))[0]
     split_name = _select_split(args.dataset, args.split)
-    return os.path.join(".", f"confusion_{args.dataset}_{split_name}_{ckpt_name}.png")
+    if args.checkpoint:
+        ckpt_name = os.path.splitext(os.path.basename(args.checkpoint))[0]
+        return os.path.join(".", f"confusion_{args.dataset}_{split_name}_{ckpt_name}.png")
+    if args.confusion_csv:
+        csv_base = os.path.splitext(os.path.basename(args.confusion_csv))[0]
+        return os.path.join(".", f"confusion_{csv_base}.png")
+    return os.path.join(".", f"confusion_{args.dataset}_{split_name}.png")
 
 
 def _resolve_confusion_csv_path(args) -> str:

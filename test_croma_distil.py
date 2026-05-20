@@ -46,6 +46,12 @@ def parse_args():
         default="row",
         help="Normalize confusion matrix by row (true), column (pred), or none",
     )
+    parser.add_argument(
+        "--log_interval",
+        type=int,
+        default=10,
+        help="Log progress every N batches (set to 1 for every batch)",
+    )
     return parser.parse_args()
 
 
@@ -168,14 +174,19 @@ def load_checkpoint(ckpt_path: str, optical_client, radar_client, ground_server,
 
 
 @torch.no_grad()
-def evaluate(loader, optical_client, radar_client, ground_server, device, num_classes: int):
+def evaluate(loader, optical_client, radar_client, ground_server, device, num_classes: int, log_interval: int):
     conf = torch.zeros((num_classes, num_classes), device=device, dtype=torch.int64)
 
     optical_client.eval()
     radar_client.eval()
     ground_server.eval()
 
-    for optical, sar, labels in loader:
+    try:
+        total_batches = len(loader)
+    except TypeError:
+        total_batches = None
+
+    for batch_idx, (optical, sar, labels) in enumerate(loader, start=1):
         optical = optical.to(device, non_blocking=True)
         sar = sar.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -199,6 +210,12 @@ def evaluate(loader, optical_client, radar_client, ground_server, device, num_cl
             y_pred = preds[valid].long()
             idx = y_true * num_classes + y_pred
             conf += torch.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+        if log_interval and (batch_idx % log_interval == 0 or (total_batches and batch_idx == total_batches)):
+            if total_batches:
+                print(f"Processed {batch_idx}/{total_batches} batches")
+            else:
+                print(f"Processed {batch_idx} batches")
 
     return conf
 
@@ -312,7 +329,15 @@ def main():
     optical_client, radar_client, ground_server = build_components(args, device, num_patches)
     load_checkpoint(args.checkpoint, optical_client, radar_client, ground_server, device)
 
-    conf = evaluate(loader, optical_client, radar_client, ground_server, device, args.num_classes)
+    conf = evaluate(
+        loader,
+        optical_client,
+        radar_client,
+        ground_server,
+        device,
+        args.num_classes,
+        args.log_interval,
+    )
 
     if args.plot_confusion:
         if args.dataset == "bigearthnet":

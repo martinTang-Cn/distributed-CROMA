@@ -137,7 +137,8 @@ def compute_comm_for_pair(
         )
         teacher_logits = logits.detach()
 
-        backward_bytes = 0
+        grad_bytes = bytes_of(optical_act) + bytes_of(radar_act)
+        backward_bytes = grad_bytes
         if enable_distill:
             optical_peer_logits_rx = radar_pred_tx if enable_peer_distill else None
             radar_peer_logits_rx = optical_pred_tx if enable_peer_distill else None
@@ -151,6 +152,7 @@ def compute_comm_for_pair(
         return {
             "input_bytes": input_bytes,
             "forward_bytes": forward_bytes,
+            "grad_bytes": grad_bytes,
             "backward_bytes": backward_bytes,
             "total_bytes": forward_bytes + backward_bytes,
         }
@@ -210,11 +212,12 @@ def main() -> None:
     for ds_name, vals in results.items():
         input_mb = vals["input_bytes"] / (1024 * 1024)
         forward_mb = vals["forward_bytes"] / (1024 * 1024)
+        grad_mb = vals["grad_bytes"] / (1024 * 1024)
         backward_mb = vals["backward_bytes"] / (1024 * 1024)
         total_mb = vals["total_bytes"] / (1024 * 1024)
         print(
             f"- {ds_name}: input={input_mb:.3f} MB, forward={forward_mb:.3f} MB, "
-            f"backward={backward_mb:.3f} MB, total={total_mb:.3f} MB"
+            f"grad={grad_mb:.3f} MB, backward={backward_mb:.3f} MB, total={total_mb:.3f} MB"
         )
 
 

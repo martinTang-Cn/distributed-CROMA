@@ -37,6 +37,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max_batches", type=int, default=0, help="0 means all batches")
     parser.add_argument("--eval_ratio", type=float, default=1.0, help="Use a subset of val set (0,1]")
+    parser.add_argument("--log_interval", type=int, default=1, help="Log every N batches")
     parser.add_argument("--output_dir", type=str, default="confusion_outputs")
     return parser.parse_args()
 
@@ -182,17 +183,22 @@ def compute_confusion_matrix(
     device: torch.device,
     ignore_index: Optional[int],
     max_batches: int,
+    log_interval: int,
 ) -> torch.Tensor:
     optical_client.eval()
     radar_client.eval()
     ground_server.eval()
 
     conf = torch.zeros((num_classes, num_classes), device=device, dtype=torch.int64)
+    total_batches = len(loader)
 
     with torch.no_grad():
         for batch_idx, (optical, radar, labels) in enumerate(loader):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
+
+            if log_interval > 0 and (batch_idx % log_interval == 0):
+                print(f"[Eval] Batch {batch_idx + 1}/{total_batches}")
 
             optical = optical.to(device, non_blocking=True)
             radar = radar.to(device, non_blocking=True)
@@ -354,6 +360,7 @@ def main():
         device=device,
         ignore_index=ignore_index,
         max_batches=args.max_batches,
+        log_interval=args.log_interval,
     )
 
     conf_np = conf.cpu().numpy().astype(np.int64)

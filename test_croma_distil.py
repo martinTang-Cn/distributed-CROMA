@@ -10,6 +10,7 @@ import csv
 import os
 from typing import Optional, Tuple
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -36,6 +37,15 @@ def parse_args():
     parser.add_argument("--num_classes", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output_csv", type=str, default="./", help="Save metrics to CSV path")
+    parser.add_argument("--plot_confusion", action="store_true", help="Save confusion matrix image")
+    parser.add_argument("--confusion_path", type=str, default=None, help="Path to save confusion matrix image")
+    parser.add_argument(
+        "--confusion_normalize",
+        type=str,
+        choices=["none", "row", "col"],
+        default="row",
+        help="Normalize confusion matrix by row (true), column (pred), or none",
+    )
     return parser.parse_args()
 
 
@@ -193,6 +203,82 @@ def evaluate(loader, optical_client, radar_client, ground_server, device, num_cl
     return conf
 
 
+def _resolve_confusion_path(args) -> str:
+    if args.confusion_path:
+        return args.confusion_path
+    ckpt_name = os.path.splitext(os.path.basename(args.checkpoint))[0]
+    split_name = _select_split(args.dataset, args.split)
+    return os.path.join(".", f"confusion_{args.dataset}_{split_name}_{ckpt_name}.png")
+
+
+def _resolve_confusion_csv_path(args) -> str:
+    image_path = _resolve_confusion_path(args)
+    base, _ = os.path.splitext(image_path)
+    return f"{base}.csv"
+
+
+def _normalize_confusion(conf: torch.Tensor, mode: str) -> torch.Tensor:
+    conf_float = conf.float()
+    if mode == "none":
+        return conf_float
+    if mode == "col":
+        denom = conf_float.sum(dim=0, keepdim=True)
+    else:
+        denom = conf_float.sum(dim=1, keepdim=True)
+    return conf_float / (denom + 1e-6)
+
+
+def save_confusion_matrix(conf: torch.Tensor, args, class_names: Optional[list] = None) -> str:
+    conf_cpu = conf.detach().to("cpu")
+    conf_norm = _normalize_confusion(conf_cpu, args.confusion_normalize)
+
+    num_classes = conf_cpu.shape[0]
+    if not class_names or len(class_names) != num_classes:
+        class_names = [str(i) for i in range(num_classes)]
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(conf_norm.numpy(), cmap="Blues")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_xticks(range(num_classes))
+    ax.set_yticks(range(num_classes))
+    ax.set_xticklabels(class_names, rotation=45, ha="right")
+    ax.set_yticklabels(class_names)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    path = _resolve_confusion_path(args)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    return path
+
+
+def save_confusion_csv(conf: torch.Tensor, args, class_names: Optional[list] = None) -> str:
+    conf_cpu = conf.detach().to("cpu")
+    conf_norm = _normalize_confusion(conf_cpu, args.confusion_normalize)
+
+    num_classes = conf_cpu.shape[0]
+    if not class_names or len(class_names) != num_classes:
+        class_names = [str(i) for i in range(num_classes)]
+
+    path = _resolve_confusion_csv_path(args)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["normalize", args.confusion_normalize])
+        writer.writerow(["true\\pred"] + class_names)
+        if args.confusion_normalize == "none":
+            for i, name in enumerate(class_names):
+                row = [name] + [str(int(v)) for v in conf_cpu[i].tolist()]
+                writer.writerow(row)
+        else:
+            for i, name in enumerate(class_names):
+                row = [name] + [f"{v:.6f}" for v in conf_norm[i].tolist()]
+                writer.writerow(row)
+    return path
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
@@ -227,6 +313,18 @@ def main():
     load_checkpoint(args.checkpoint, optical_client, radar_client, ground_server, device)
 
     conf = evaluate(loader, optical_client, radar_client, ground_server, device, args.num_classes)
+
+    if args.plot_confusion:
+        if args.dataset == "bigearthnet":
+            class_names = CLASS_NAMES
+        elif args.dataset == "houston2013":
+            class_names = None
+        else:
+            class_names = [str(i) for i in range(args.num_classes)]
+        out_path = save_confusion_matrix(conf, args, class_names)
+        csv_path = save_confusion_csv(conf, args, class_names)
+        print(f"Confusion matrix saved to: {out_path}")
+        print(f"Confusion matrix CSV saved to: {csv_path}")
 
     diag = torch.diag(conf).float()
     row_sum = conf.sum(dim=1).float()

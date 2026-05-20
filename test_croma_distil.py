@@ -348,7 +348,6 @@ def load_confusion_csv(path: str) -> Tuple[torch.Tensor, list, str]:
     header = rows[start_idx]
     if len(header) < 2:
         raise ValueError("Confusion CSV header is invalid.")
-    class_names = header[1:]
 
     data_rows = rows[start_idx + 1 :]
     if not data_rows:
@@ -364,6 +363,7 @@ def load_confusion_csv(path: str) -> Tuple[torch.Tensor, list, str]:
         raise ValueError("Confusion CSV contains no numeric values.")
 
     conf = torch.tensor(values, dtype=torch.float32)
+    class_names = [str(i) for i in range(conf.shape[0])]
     return conf, class_names, normalize
 
 

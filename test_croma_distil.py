@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from datasets import WHUOptSarPatchDataset, BigEarthNetDataset, Houston2013PatchDataset, CLASS_NAMES
 from pretrain_croma import CROMA
@@ -52,6 +52,13 @@ def parse_args():
         default=10,
         help="Log progress every N batches (set to 1 for every batch)",
     )
+    parser.add_argument(
+        "--eval_ratio",
+        type=float,
+        default=1.0,
+        help="Use a subset of the dataset (0 < ratio <= 1)",
+    )
+    parser.add_argument("--eval_seed", type=int, default=42, help="Seed for subset sampling")
     return parser.parse_args()
 
 
@@ -94,6 +101,16 @@ def create_loader(args) -> Tuple[DataLoader, Optional[int]]:
             patch_size=args.image_size,
             stride=args.image_size,
         )
+
+    if args.eval_ratio <= 0 or args.eval_ratio > 1.0:
+        raise ValueError("eval_ratio must be in (0, 1].")
+    if args.eval_ratio < 1.0:
+        total = len(ds)
+        target = max(1, int(total * args.eval_ratio))
+        g = torch.Generator()
+        g.manual_seed(args.eval_seed)
+        indices = torch.randperm(total, generator=g)[:target].tolist()
+        ds = Subset(ds, indices)
 
     loader = DataLoader(
         ds,

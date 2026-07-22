@@ -41,9 +41,9 @@ def build_clients(
     opt_channels: int,
     radar_channels: int,
     image_size: int = 256,
-    vit_patch_size: int = 8,
-    encoder_dim: int = 768,
-    encoder_layers: int = 6,
+    vit_patch_size: int = 16,
+    encoder_dim: int = 192,
+    encoder_layers: int = 4,
     attention_heads: int = 16,
     decoder_dim: int = 512,
     decoder_layers: int = 1,
@@ -96,7 +96,7 @@ def flops_for_client(model: torch.nn.Module, input_tensor: torch.Tensor) -> floa
 
 def main() -> None:
     device = torch.device("cpu")
-    image_size = 256
+    image_size = 128
 
     results: Dict[str, Dict[str, float]] = {}
 

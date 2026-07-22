@@ -556,7 +556,7 @@ def parse_args():
     parser.add_argument("--lr_server", type=float, default=1e-4, help="服务器学习率")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     
-    parser.add_argument("--encoder_dim", type=int, default=768)
+    parser.add_argument("--encoder_dim", type=int, default=192)
     parser.add_argument("--encoder_layers", type=int, default=6)
     parser.add_argument("--attention_heads", type=int, default=16)
     parser.add_argument("--decoder_dim", type=int, default=512)

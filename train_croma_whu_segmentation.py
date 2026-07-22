@@ -175,6 +175,12 @@ def parse_args():
         action="store_true",
         help="只在训练全部完成后保存一次模型（默认每个 epoch 保存一次）",
     )
+    parser.add_argument(
+        "--freeze_encoders",
+        action="store_true",
+        default=False,
+        help="冻结 CROMA 的 radar_encoder 和 optical_encoder 参数，仅训练 cross_encoder 和分割头",
+    )
     return parser.parse_args()
 
 
@@ -621,6 +627,32 @@ def main():
         )
 
     model, _ = build_model(args, device, inferred_num_patches=inferred_num_patches)
+
+    # 冻结雷达编码器和光学编码器
+    if args.freeze_encoders:
+        # 需要先拿到内部 CROMA 模型引用（DDP 包裹前）
+        croma_to_freeze = model.croma
+        for param in croma_to_freeze.radar_encoder.parameters():
+            param.requires_grad = False
+        for param in croma_to_freeze.optical_encoder.parameters():
+            param.requires_grad = False
+        if rank == 0:
+            frozen_radar = sum(
+                p.numel() for p in croma_to_freeze.radar_encoder.parameters()
+            )
+            frozen_opt = sum(
+                p.numel() for p in croma_to_freeze.optical_encoder.parameters()
+            )
+            trainable = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            total = sum(p.numel() for p in model.parameters())
+            print(
+                f"[Freeze] radar_encoder frozen: {frozen_radar:,} | "
+                f"optical_encoder frozen: {frozen_opt:,} | "
+                f"trainable: {trainable:,} / total: {total:,}"
+            )
+
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 

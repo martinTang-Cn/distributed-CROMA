@@ -18,6 +18,9 @@ from torch.utils.data import DataLoader, Subset
 from datasets import WHUOptSarPatchDataset, BigEarthNetDataset, Houston2013PatchDataset, CLASS_NAMES
 from pretrain_croma import CROMA
 
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 或 ['Microsoft YaHei'] 微软雅黑 等
+plt.rcParams['axes.unicode_minus'] = False   # 解决负号 '-' 显示为方块的问题
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate distillation checkpoints on test splits")
@@ -288,13 +291,16 @@ def save_confusion_matrix(
 
     fig, ax = plt.subplots(figsize=(8, 8))
     im = ax.imshow(conf_norm.numpy(), cmap="Blues")
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
+    ax.set_xlabel("True", fontsize=22)
+    ax.set_ylabel("Predicted", fontsize=22)
     ax.set_xticks(range(num_classes))
     ax.set_yticks(range(num_classes))
-    ax.set_xticklabels(class_names, rotation=45, ha="right")
-    ax.set_yticklabels(class_names)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    tick_fontsize = 18
+    ax.set_xticklabels(class_names, rotation=45, ha="right", fontsize=tick_fontsize)
+    ax.set_yticklabels(class_names, fontsize=tick_fontsize)
+    ax.tick_params(axis="both", which="major", labelsize=tick_fontsize)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=tick_fontsize)
 
     path = _resolve_confusion_path(args)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

@@ -146,8 +146,8 @@ def parse_args():
     parser.add_argument(
         "--pretrained_ckpt",
         type=str,
-        required=True,
-        help="预训练 CROMA checkpoint 路径 (train_croma_whu_pretrain.py 保存的 .pt 文件)",
+        default="",
+        help="预训练 CROMA checkpoint 路径（为空则随机初始化模型）",
     )
     parser.add_argument(
         "--output_dir",
@@ -309,14 +309,17 @@ def build_model(args, device, inferred_num_patches=None):
         radar_channels=radar_ch,
     )
 
-    # 加载预训练权重
-    ckpt = torch.load(args.pretrained_ckpt, map_location="cpu")
-    state_dict = ckpt.get("model_state_dict", ckpt)
-    missing, unexpected = croma.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"[Warning] Missing keys when loading CROMA: {missing}")
-    if unexpected:
-        print(f"[Warning] Unexpected keys when loading CROMA: {unexpected}")
+    # 加载预训练权重（若提供了 checkpoint 路径）
+    if args.pretrained_ckpt:
+        ckpt = torch.load(args.pretrained_ckpt, map_location="cpu")
+        state_dict = ckpt.get("model_state_dict", ckpt)
+        missing, unexpected = croma.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[Warning] Missing keys when loading CROMA: {missing}")
+        if unexpected:
+            print(f"[Warning] Unexpected keys when loading CROMA: {unexpected}")
+    else:
+        print("[Info] pretrained_ckpt 为空，模型将随机初始化")
 
     croma.to(device)
 

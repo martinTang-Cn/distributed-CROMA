@@ -6,6 +6,9 @@ import numpy as np
 import torch
 import pandas as pd
 import rasterio
+from rasterio.errors import NotGeoreferencedWarning
+import warnings
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 from PIL import Image, ImageDraw, ImageFont
 
 from datasets import CASI_FILE, LIDAR_FILE, Houston2013PatchDataset

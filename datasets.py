@@ -7,6 +7,9 @@ torch.set_printoptions(profile="full")
 from PIL import Image
 import rasterio
 from rasterio.enums import Resampling
+from rasterio.errors import NotGeoreferencedWarning
+import warnings
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 import random
 import pandas as pd
 import re

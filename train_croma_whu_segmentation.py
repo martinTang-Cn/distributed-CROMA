@@ -198,7 +198,7 @@ def create_loaders(args, rank, world_size, distributed):
             split="val",
             patch_size=args.image_size,
             stride_ratio=args.stride_ratio,
-            num_ratio=1.0,
+            num_ratio=args.num_ratio,
         )
     elif args.dataset == "bigearthnet":
         train_set = BigEarthNetDataset(

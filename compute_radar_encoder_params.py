@@ -67,8 +67,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="计算 CROMA optical/radar_encoder、cross_encoder (joint) 与 seg_head 的参数大小 (MB)"
     )
-    parser.add_argument("--image_size", type=int, default=8)
-    parser.add_argument("--vit_patch_size", type=int, default=1)
+    parser.add_argument("--image_size", type=int, default=128)
+    parser.add_argument("--vit_patch_size", type=int, default=8)
     parser.add_argument("--encoder_dim", type=int, default=192)
     parser.add_argument("--encoder_layers", type=int, default=6)
     parser.add_argument("--attention_heads", type=int, default=16)

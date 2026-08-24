@@ -645,9 +645,11 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
 
     Returns:
         avg_loss: 按像素加权的连接阶段平均交叉熵损失
+        avg_proj_loss: 按像素加权的连接阶段平均投影蒸馏损失
         total_forward_bytes: 通信量统计（激活值上传）
     """
     total_loss = 0.0
+    total_proj_loss = 0.0
     total_pixels = 0
     total_forward_bytes = 0
 
@@ -661,6 +663,7 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
 
         # ===== 连接阶段：训练服务器 + 两个投影模型 =====
         conn_loss = 0.0
+        conn_proj_loss = 0.0
         conn_pixels = 0
         for step, (optical, sar, labels) in enumerate(loader):
             loss_ce, loss_proj, fwd_bytes = server_connect_step(
@@ -678,6 +681,7 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
 
             pixels = labels.numel()
             conn_loss += loss_ce * pixels
+            conn_proj_loss += loss_proj * pixels
             conn_pixels += pixels
             total_forward_bytes += fwd_bytes
 
@@ -690,11 +694,13 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
                 )
 
         conn_avg = conn_loss / max(1, conn_pixels)
+        conn_proj_avg = conn_proj_loss / max(1, conn_pixels)
         total_loss += conn_loss
+        total_proj_loss += conn_proj_loss
         total_pixels += conn_pixels
         print(
             f"[Epoch {epoch}] Client {client_id+1}/{args.num_clients} 连接阶段完成 | "
-            f"平均 CE 损失: {conn_avg:.4f}"
+            f"平均 CE 损失: {conn_avg:.4f} | 平均 Proj 损失: {conn_proj_avg:.4f}"
         )
 
         # ===== 断开连接：客户端本地训练（紧接其后） =====
@@ -703,7 +709,8 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
         )
 
     avg_loss = total_loss / max(1, total_pixels)
-    return avg_loss, total_forward_bytes
+    avg_proj_loss = total_proj_loss / max(1, total_pixels)
+    return avg_loss, avg_proj_loss, total_forward_bytes
 
 
 def aggregate_client_models(clients: List[SplitClient], device: torch.device) -> OrderedDict:
@@ -976,7 +983,7 @@ def main():
         sync_clients_to_global(clients, global_state)
 
         # ===== 2. 服务器依次连接各客户端：连接阶段训练 + 断开后本地训练 =====
-        train_loss, fwd_bytes = train_one_round(
+        train_loss, train_proj_loss, fwd_bytes = train_one_round(
             args, clients, server, server_optimizer, proj_optimizer,
             client_loaders, criterion, device, epoch, start_time,
         )
@@ -1001,6 +1008,7 @@ def main():
                     writer.writerow([
                         "epoch",
                         "train_loss",
+                        "train_proj_loss",
                         "val_loss",
                         "val_OA",
                         "val_AA",
@@ -1011,6 +1019,7 @@ def main():
                 writer.writerow([
                     epoch,
                     float(train_loss),
+                    float(train_proj_loss),
                     float(val_loss),
                     float(val_metrics["oa"]),
                     float(val_metrics["aa"]),
@@ -1023,6 +1032,7 @@ def main():
                     writer.writerow([
                         "epoch",
                         "train_loss",
+                        "train_proj_loss",
                         "val_loss",
                         "val_mIoU",
                         "round_comm_MB",
@@ -1031,6 +1041,7 @@ def main():
                 writer.writerow([
                     epoch,
                     float(train_loss),
+                    float(train_proj_loss),
                     float(val_loss),
                     float(val_metrics["miou"]),
                     epoch_comm_bytes / (1024 * 1024),

@@ -487,7 +487,8 @@ def server_connect_step(client: SplitClient, server: ServerModel,
 
     Returns:
         loss_ce: 当前 batch 的交叉熵损失
-        loss_proj: 当前 batch 的投影蒸馏损失
+        loss_proj_OM: 当前 batch 的 proj_OM 投影蒸馏损失
+        loss_proj_RM: 当前 batch 的 proj_RM 投影蒸馏损失
         forward_bytes: 前向传输字节数（激活值）
     """
     optical = optical.to(device, non_blocking=True)
@@ -530,10 +531,9 @@ def server_connect_step(client: SplitClient, server: ServerModel,
 
     # ===== 阶段 5: 训练两个投影模型（以 joint_encodings 为标签做蒸馏） =====
     joint_target = joint_encodings.detach()
-    loss_proj = (
-        F.mse_loss(server.proj_OM(optical_act), joint_target)
-        + F.mse_loss(server.proj_RM(radar_act), joint_target)
-    )
+    loss_proj_OM = F.mse_loss(server.proj_OM(optical_act), joint_target)
+    loss_proj_RM = F.mse_loss(server.proj_RM(radar_act), joint_target)
+    loss_proj = loss_proj_OM + loss_proj_RM
     proj_optimizer.zero_grad(set_to_none=True)
     loss_proj.backward()
     if max_grad_norm > 0:
@@ -543,7 +543,7 @@ def server_connect_step(client: SplitClient, server: ServerModel,
         )
     proj_optimizer.step()
 
-    return loss_ce.item(), loss_proj.item(), forward_bytes
+    return loss_ce.item(), loss_proj_OM.item(), loss_proj_RM.item(), forward_bytes
 
 
 def client_local_train(args, client: SplitClient, server: ServerModel,
@@ -645,11 +645,13 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
 
     Returns:
         avg_loss: 按像素加权的连接阶段平均交叉熵损失
-        avg_proj_loss: 按像素加权的连接阶段平均投影蒸馏损失
+        avg_proj_OM_loss: 按像素加权的连接阶段平均 proj_OM 蒸馏损失
+        avg_proj_RM_loss: 按像素加权的连接阶段平均 proj_RM 蒸馏损失
         total_forward_bytes: 通信量统计（激活值上传）
     """
     total_loss = 0.0
-    total_proj_loss = 0.0
+    total_proj_OM_loss = 0.0
+    total_proj_RM_loss = 0.0
     total_pixels = 0
     total_forward_bytes = 0
 
@@ -663,10 +665,11 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
 
         # ===== 连接阶段：训练服务器 + 两个投影模型 =====
         conn_loss = 0.0
-        conn_proj_loss = 0.0
+        conn_proj_OM_loss = 0.0
+        conn_proj_RM_loss = 0.0
         conn_pixels = 0
         for step, (optical, sar, labels) in enumerate(loader):
-            loss_ce, loss_proj, fwd_bytes = server_connect_step(
+            loss_ce, loss_proj_OM, loss_proj_RM, fwd_bytes = server_connect_step(
                 client=client,
                 server=server,
                 optical=optical,
@@ -681,7 +684,8 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
 
             pixels = labels.numel()
             conn_loss += loss_ce * pixels
-            conn_proj_loss += loss_proj * pixels
+            conn_proj_OM_loss += loss_proj_OM * pixels
+            conn_proj_RM_loss += loss_proj_RM * pixels
             conn_pixels += pixels
             total_forward_bytes += fwd_bytes
 
@@ -690,17 +694,21 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
                 elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
                 print(
                     f"[{elapsed_str}] Epoch {epoch} | Client {client_id+1}/{args.num_clients} | "
-                    f"Step {step+1}/{len(loader)} | CE: {loss_ce:.4f} | Proj: {loss_proj:.4f}"
+                    f"Step {step+1}/{len(loader)} | CE: {loss_ce:.4f} | "
+                    f"Proj_OM: {loss_proj_OM:.4f} | Proj_RM: {loss_proj_RM:.4f}"
                 )
 
         conn_avg = conn_loss / max(1, conn_pixels)
-        conn_proj_avg = conn_proj_loss / max(1, conn_pixels)
+        conn_proj_OM_avg = conn_proj_OM_loss / max(1, conn_pixels)
+        conn_proj_RM_avg = conn_proj_RM_loss / max(1, conn_pixels)
         total_loss += conn_loss
-        total_proj_loss += conn_proj_loss
+        total_proj_OM_loss += conn_proj_OM_loss
+        total_proj_RM_loss += conn_proj_RM_loss
         total_pixels += conn_pixels
         print(
             f"[Epoch {epoch}] Client {client_id+1}/{args.num_clients} 连接阶段完成 | "
-            f"平均 CE 损失: {conn_avg:.4f} | 平均 Proj 损失: {conn_proj_avg:.4f}"
+            f"平均 CE 损失: {conn_avg:.4f} | 平均 Proj_OM: {conn_proj_OM_avg:.4f} | "
+            f"平均 Proj_RM: {conn_proj_RM_avg:.4f}"
         )
 
         # ===== 断开连接：客户端本地训练（紧接其后） =====
@@ -709,8 +717,9 @@ def train_one_round(args, clients: List[SplitClient], server: ServerModel,
         )
 
     avg_loss = total_loss / max(1, total_pixels)
-    avg_proj_loss = total_proj_loss / max(1, total_pixels)
-    return avg_loss, avg_proj_loss, total_forward_bytes
+    avg_proj_OM_loss = total_proj_OM_loss / max(1, total_pixels)
+    avg_proj_RM_loss = total_proj_RM_loss / max(1, total_pixels)
+    return avg_loss, avg_proj_OM_loss, avg_proj_RM_loss, total_forward_bytes
 
 
 def aggregate_client_models(clients: List[SplitClient], device: torch.device) -> OrderedDict:
@@ -983,7 +992,7 @@ def main():
         sync_clients_to_global(clients, global_state)
 
         # ===== 2. 服务器依次连接各客户端：连接阶段训练 + 断开后本地训练 =====
-        train_loss, train_proj_loss, fwd_bytes = train_one_round(
+        train_loss, train_proj_OM_loss, train_proj_RM_loss, fwd_bytes = train_one_round(
             args, clients, server, server_optimizer, proj_optimizer,
             client_loaders, criterion, device, epoch, start_time,
         )
@@ -1008,7 +1017,8 @@ def main():
                     writer.writerow([
                         "epoch",
                         "train_loss",
-                        "train_proj_loss",
+                        "train_proj_OM_loss",
+                        "train_proj_RM_loss",
                         "val_loss",
                         "val_OA",
                         "val_AA",
@@ -1019,7 +1029,8 @@ def main():
                 writer.writerow([
                     epoch,
                     float(train_loss),
-                    float(train_proj_loss),
+                    float(train_proj_OM_loss),
+                    float(train_proj_RM_loss),
                     float(val_loss),
                     float(val_metrics["oa"]),
                     float(val_metrics["aa"]),
@@ -1032,7 +1043,8 @@ def main():
                     writer.writerow([
                         "epoch",
                         "train_loss",
-                        "train_proj_loss",
+                        "train_proj_OM_loss",
+                        "train_proj_RM_loss",
                         "val_loss",
                         "val_mIoU",
                         "round_comm_MB",
@@ -1041,7 +1053,8 @@ def main():
                 writer.writerow([
                     epoch,
                     float(train_loss),
-                    float(train_proj_loss),
+                    float(train_proj_OM_loss),
+                    float(train_proj_RM_loss),
                     float(val_loss),
                     float(val_metrics["miou"]),
                     epoch_comm_bytes / (1024 * 1024),
